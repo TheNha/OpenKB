@@ -189,6 +189,19 @@ def _build_index_config(
         "if_add_node_summary": True,
         "if_add_doc_description": True,
     }
+    # Forward language to PageIndex for language-aware indexing (e.g. OCR,
+    # TOC extraction, summarization). Gracefully ignored on older PageIndex
+    # versions that do not yet declare the field.
+    language = config.get("language", "en")
+    if language:
+        if "language" in IndexConfig.model_fields:
+            kwargs["language"] = language
+        else:
+            logger.warning(
+                "config: 'language' is set but the installed PageIndex "
+                "version does not support it yet — ignoring it."
+            )
+
     concurrency = resolve_concurrency(config)
     if concurrency is not None:
         if "max_concurrency" in IndexConfig.model_fields:
