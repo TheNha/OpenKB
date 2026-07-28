@@ -27,8 +27,17 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 #   - dataset
 #   - model
 
-# Optional: LLM / LiteLLM tuning. Keys are forwarded to LiteLLM; `timeout` and
-# `extra_headers` apply per request, the rest are set as litellm.<key>.
+# Optional: extra JSON fields merged into every LLM request body — for
+# OpenAI-compatible backends that accept non-standard params (e.g. vLLM/SGLang
+# serving Qwen3). Applies to compile, query, chat, lint, skill, AND PageIndex's
+# own indexing calls for long documents.
+# extra_body:
+#   chat_template_kwargs:
+#     enable_thinking: false   # turn off Qwen3's default "thinking" mode
+
+# Optional: LLM / LiteLLM tuning. Keys are forwarded to LiteLLM; `timeout`,
+# `extra_headers`, and `extra_body` apply per request, the rest are set as
+# litellm.<key>.
 # litellm:
 #   timeout: 1200          # per-request timeout (s); raise for slow local backends (Ollama)
 #   drop_params: true      # let LiteLLM drop params a provider rejects (e.g. Ollama)

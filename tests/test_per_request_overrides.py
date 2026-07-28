@@ -18,8 +18,18 @@ def test_litellm_extra_headers_overrides_top_level():
         "extra_headers": {"Editor-Version": "top-level"},
         "litellm": {"extra_headers": {"Editor-Version": "from-litellm"}},
     }
-    headers, _timeout, _litellm = resolve_per_request_overrides(config)
+    headers, _timeout, _extra_body, _litellm = resolve_per_request_overrides(config)
     assert headers == {"Editor-Version": "from-litellm"}
+
+
+def test_litellm_extra_body_overrides_top_level():
+    """litellm.extra_body must override the top-level extra_body key."""
+    config = {
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        "litellm": {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+    }
+    _headers, _timeout, extra_body, _litellm = resolve_per_request_overrides(config)
+    assert extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 def test_litellm_timeout_overrides_top_level():
@@ -28,7 +38,7 @@ def test_litellm_timeout_overrides_top_level():
         "timeout": 30,
         "litellm": {"timeout": 120},
     }
-    _headers, timeout, _litellm = resolve_per_request_overrides(config)
+    _headers, timeout, _extra_body, _litellm = resolve_per_request_overrides(config)
     assert timeout == 120
 
 
@@ -41,7 +51,7 @@ def test_popped_keys_absent_from_litellm_settings():
             "drop_params": True,  # genuine module-level setting, must survive
         },
     }
-    _h, _t, litellm_settings = resolve_per_request_overrides(config)
+    _h, _t, _eb, litellm_settings = resolve_per_request_overrides(config)
     assert "extra_headers" not in litellm_settings
     assert "timeout" not in litellm_settings
     assert litellm_settings == {"drop_params": True}
@@ -50,9 +60,10 @@ def test_popped_keys_absent_from_litellm_settings():
 def test_no_litellm_block_preserves_top_level():
     """Without a litellm: block, top-level extra_headers/timeout pass through."""
     config = {"extra_headers": {"Editor-Version": "ok"}, "timeout": 45}
-    headers, timeout, litellm_settings = resolve_per_request_overrides(config)
+    headers, timeout, extra_body, litellm_settings = resolve_per_request_overrides(config)
     assert headers == {"Editor-Version": "ok"}
     assert timeout == 45
+    assert extra_body == {}
     assert litellm_settings == {}
 
 
@@ -78,6 +89,55 @@ def test_bundle_reads_litellm_extra_headers(tmp_path):
     assert bundle.timeout == 60
     assert bundle.parallel_tool_calls is True
     assert bundle.parallel_tool_calls_explicit is True
+
+
+def test_bundle_reads_extra_body(tmp_path):
+    """resolve_credential_bundle must surface top-level extra_body, so a REST
+    request threads e.g. Qwen3's enable_thinking toggle to LiteLLM just like
+    the CLI path does via the process-wide runtime global."""
+    _write_config(
+        tmp_path,
+        {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+    )
+    bundle = resolve_credential_bundle(tmp_path)
+    assert bundle.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_bundle_extra_body_falls_back_to_global(monkeypatch, tmp_path):
+    """A KB with no extra_body of its own inherits global.yaml's extra_body —
+    so Qwen3's enable_thinking toggle can be set once for every KB."""
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "global.yaml").write_text(
+        "extra_body:\n  chat_template_kwargs:\n    enable_thinking: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_DIR", global_dir)
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_PATH", global_dir / "global.yaml")
+
+    kb_dir = tmp_path / "kb"
+    _write_config(kb_dir, {})  # no extra_body of its own
+
+    bundle = resolve_credential_bundle(kb_dir)
+    assert bundle.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_bundle_extra_body_kb_overrides_global(monkeypatch, tmp_path):
+    """A KB-set extra_body wins over global.yaml's, not merged with it."""
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "global.yaml").write_text(
+        "extra_body:\n  chat_template_kwargs:\n    enable_thinking: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_DIR", global_dir)
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_PATH", global_dir / "global.yaml")
+
+    kb_dir = tmp_path / "kb"
+    _write_config(kb_dir, {"extra_body": {"custom_kwarg": True}})
+
+    bundle = resolve_credential_bundle(kb_dir)
+    assert bundle.extra_body == {"custom_kwarg": True}
 
 
 def test_bundle_has_no_litellm_settings_field():

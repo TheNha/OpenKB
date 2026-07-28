@@ -32,6 +32,7 @@ import litellm
 from openkb import frontmatter
 from openkb.config import (
     DEFAULT_ENTITY_TYPES,
+    get_extra_body,
     get_extra_headers,
     get_timeout,
     resolve_entity_types,
@@ -411,6 +412,9 @@ def _llm_call(
     extra_headers = bundle.extra_headers if bundle is not None else get_extra_headers()
     if extra_headers:
         kwargs.setdefault("extra_headers", extra_headers)
+    extra_body = bundle.extra_body if bundle is not None else get_extra_body()
+    if extra_body:
+        kwargs.setdefault("extra_body", extra_body)
     timeout = bundle.timeout if bundle is not None else get_timeout()
     if timeout is not None:
         kwargs.setdefault("timeout", timeout)
@@ -454,6 +458,9 @@ async def _llm_call_async(
     extra_headers = bundle.extra_headers if bundle is not None else get_extra_headers()
     if extra_headers:
         kwargs.setdefault("extra_headers", extra_headers)
+    extra_body = bundle.extra_body if bundle is not None else get_extra_body()
+    if extra_body:
+        kwargs.setdefault("extra_body", extra_body)
     timeout = bundle.timeout if bundle is not None else get_timeout()
     if timeout is not None:
         kwargs.setdefault("timeout", timeout)

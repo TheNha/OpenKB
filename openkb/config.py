@@ -11,6 +11,24 @@ from typing import Any, Iterator
 
 import yaml
 
+# Process-wide LLM runtime settings (extra_headers/extra_body/timeout/
+# parallel_tool_calls + resolve_model_settings) live in openkb/llm_runtime.py
+# (self-contained, no dependency on the rest of this module — split out to
+# stay under the file-size limit, see docs/golden-principles.md#file-size).
+# Re-exported here so existing ``from openkb.config import get_extra_headers``
+# (etc.) call sites keep working unchanged.
+from openkb.llm_runtime import (  # noqa: F401 (re-export for backward compat)
+    get_extra_body,
+    get_extra_headers,
+    get_parallel_tool_calls,
+    get_timeout,
+    get_timeout_extra_args,
+    resolve_model_settings,
+    set_extra_body,
+    set_extra_headers,
+    set_parallel_tool_calls,
+    set_timeout,
+)
 from openkb.locks import atomic_write_text, flock, funlock
 
 logger = logging.getLogger(__name__)
@@ -38,7 +56,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "entity_types": list(DEFAULT_ENTITY_TYPES),
 }
 
-GLOBAL_CONFIG_DIR = Path.home() / ".config" / "openkb"
+# Default ``~/.config/openkb``; override with env ``OPENKB_CONFIG_DIR`` to move
+# global.yaml / the global .env / the default KB root out of $HOME entirely
+# (e.g. into a project checkout). Read once at import — set it before the
+# process starts (shell export, not mid-session).
+_configured_config_dir = os.environ.get("OPENKB_CONFIG_DIR")
+GLOBAL_CONFIG_DIR = (
+    Path(_configured_config_dir).expanduser().resolve()
+    if _configured_config_dir
+    else Path.home() / ".config" / "openkb"
+)
 GLOBAL_CONFIG_PATH = GLOBAL_CONFIG_DIR / "global.yaml"
 GLOBAL_CONFIG_LOCK_PATH = GLOBAL_CONFIG_DIR / "global.lock"
 
@@ -182,6 +209,24 @@ def resolve_extra_headers(config: dict) -> dict[str, str]:
     return headers
 
 
+def resolve_extra_body(config: dict) -> dict[str, Any]:
+    """Resolve the optional ``extra_body:`` mapping, forwarded verbatim as
+    LiteLLM's ``extra_body`` on every LLM call (e.g. vLLM/SGLang's
+    ``chat_template_kwargs: {enable_thinking: false}`` for Qwen3). Values may
+    be nested JSON, unlike ``extra_headers``. Non-mapping is ignored, warned.
+    """
+    raw = config.get("extra_body")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(
+            "config: 'extra_body' must be a mapping, got %s — ignoring it.",
+            type(raw).__name__,
+        )
+        return {}
+    return dict(raw)
+
+
 def resolve_parallel_tool_calls(config: dict) -> tuple[bool | None, bool]:
     """Resolve the optional ``parallel_tool_calls:`` key to ``(value, was_explicit)``.
 
@@ -298,16 +343,17 @@ def resolve_litellm_settings(config: dict) -> dict[str, Any]:
 # REST paths apply identical litellm.* override semantics.
 def resolve_per_request_overrides(
     config: dict[str, Any],
-) -> tuple[dict[str, str], float | None, dict[str, Any]]:
-    """Resolve extra_headers / timeout / litellm_settings with litellm.* overrides.
+) -> tuple[dict[str, str], float | None, dict[str, Any], dict[str, Any]]:
+    """Resolve extra_headers / timeout / extra_body / litellm_settings.
 
-    ``litellm.extra_headers`` / ``litellm.timeout`` override the top-level
-    ``extra_headers`` / ``timeout`` keys (matching legacy precedence), and are
-    popped from the returned ``litellm_settings`` so they are not also applied
-    as process-wide litellm module settings.
+    ``litellm.extra_headers`` / ``litellm.timeout`` / ``litellm.extra_body``
+    override their top-level counterparts (legacy precedence) and are popped
+    from ``litellm_settings`` so they aren't also applied as process-wide
+    litellm module settings.
     """
     extra_headers = resolve_extra_headers(config)
     timeout = resolve_timeout(config)
+    extra_body = resolve_extra_body(config)
     litellm_settings = resolve_litellm_settings(config)
     if "extra_headers" in litellm_settings:
         extra_headers = resolve_extra_headers(
@@ -315,80 +361,9 @@ def resolve_per_request_overrides(
         )
     if "timeout" in litellm_settings:
         timeout = resolve_timeout({"timeout": litellm_settings.pop("timeout")})
-    return extra_headers, timeout, litellm_settings
-
-
-_runtime_extra_headers: dict[str, str] = {}
-
-
-def set_extra_headers(headers: dict[str, str]) -> None:
-    """Set the process-wide extra headers for LLM requests."""
-    global _runtime_extra_headers
-    _runtime_extra_headers = dict(headers)
-
-
-def get_extra_headers() -> dict[str, str]:
-    """Return a copy of the process-wide extra headers for LLM requests."""
-    return dict(_runtime_extra_headers)
-
-
-# Process-wide LLM request timeout (seconds), set from config by the CLI and
-# read at the call sites via get_timeout(). None = use LiteLLM's default.
-_runtime_timeout: float | None = None
-
-
-def set_timeout(timeout: float | None) -> None:
-    """Set the process-wide LLM request timeout in seconds; ``None`` clears it."""
-    global _runtime_timeout
-    _runtime_timeout = timeout
-
-
-def get_timeout() -> float | None:
-    """Return the process-wide LLM request timeout in seconds, or ``None``."""
-    return _runtime_timeout
-
-
-def get_timeout_extra_args() -> dict[str, float] | None:
-    """Timeout as Agents-SDK ``ModelSettings.extra_args`` (it has no ``timeout``
-    field), or ``None``. The LiteLLM provider forwards it to the completion call.
-    """
-    return {"timeout": _runtime_timeout} if _runtime_timeout is not None else None
-
-
-# Process-wide agent ``parallel_tool_calls`` as ``(value, was_explicit)``, set
-# from config by the CLI and read when building agents. ``(None, False)`` = not
-# configured, so each agent falls back to its own default (resolve_model_settings).
-_runtime_parallel_tool_calls: tuple[bool | None, bool] = (None, False)
-
-
-def set_parallel_tool_calls(value: bool | None, was_explicit: bool) -> None:
-    """Set the process-wide ``parallel_tool_calls`` — see :func:`resolve_parallel_tool_calls`."""
-    global _runtime_parallel_tool_calls
-    _runtime_parallel_tool_calls = (value, was_explicit)
-
-
-def get_parallel_tool_calls() -> tuple[bool | None, bool]:
-    """Return the process-wide ``parallel_tool_calls`` as ``(value, was_explicit)``."""
-    return _runtime_parallel_tool_calls
-
-
-def resolve_model_settings(*, default_parallel_tool_calls: bool | None = False) -> dict[str, Any]:
-    """Assemble the agents-SDK ``ModelSettings`` kwargs from the process-wide LLM
-    runtime settings — the single place tool-using agent builders wire them in.
-
-    ``default_parallel_tool_calls`` (the caller's own historical default) is used
-    only when config didn't set ``parallel_tool_calls``; an explicit value always
-    wins. Tool-less agents (skill-eval graders) skip this and omit the setting —
-    the SDK forwards an explicit ``False`` even without tools, which strict
-    OpenAI-compatible endpoints reject.
-    """
-    value, was_explicit = get_parallel_tool_calls()
-    parallel_tool_calls = value if was_explicit else default_parallel_tool_calls
-    return {
-        "extra_headers": get_extra_headers() or None,
-        "extra_args": get_timeout_extra_args(),
-        "parallel_tool_calls": parallel_tool_calls,
-    }
+    if "extra_body" in litellm_settings:
+        extra_body = resolve_extra_body({"extra_body": litellm_settings.pop("extra_body")})
+    return extra_headers, timeout, extra_body, litellm_settings
 
 
 @dataclass(frozen=True)
@@ -405,6 +380,7 @@ class LlmCredentialBundle:
     api_key: str | None = None
     base_url: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
+    extra_body: dict[str, Any] = field(default_factory=dict)
     timeout: float | None = None
     parallel_tool_calls: bool | None = None
     parallel_tool_calls_explicit: bool = False
@@ -416,11 +392,12 @@ def resolve_credential_bundle(kb_dir: Path) -> LlmCredentialBundle:
     Resolves ``LLM_API_KEY`` / ``OPENAI_API_BASE`` with per-KB precedence — the
     KB's own ``.env`` first, then the process environment, then the global
     ``~/.config/openkb/.env`` — and reads the KB's ``config.yaml`` for
-    ``extra_headers`` / ``timeout`` / ``litellm``. This honors the same sources
-    as ``cli._setup_llm_key`` (so a server configured via a process env var or
-    the global ``.env`` keeps working) but is side-effect-free: ``os.environ``
-    is never written, so concurrent requests for different KBs cannot see each
-    other's key.
+    ``extra_headers`` / ``extra_body`` / ``timeout`` / ``litellm`` (``extra_body``
+    additionally falls back to global.yaml's own ``extra_body`` when the KB
+    doesn't set one). This honors the same sources as ``cli._setup_llm_key``
+    (so a server configured via a process env var or the global ``.env`` keeps
+    working) but is side-effect-free: ``os.environ`` is never written, so
+    concurrent requests for different KBs cannot see each other's key.
     """
     kb_values: dict[str, str | None] = {}
     kb_env = kb_dir / ".env"
@@ -444,24 +421,32 @@ def resolve_credential_bundle(kb_dir: Path) -> LlmCredentialBundle:
     api_key = _resolve_env("LLM_API_KEY")
     base_url = _resolve_env("OPENAI_API_BASE")
 
-    extra_headers: dict[str, str] = {}
-    timeout: float | None = None
-    parallel_tool_calls: bool | None = None
-    parallel_tool_calls_explicit = False
-    config_path = kb_dir / ".openkb" / "config.yaml"
-    if config_path.exists():
-        config = load_config(config_path)
-        # Shared resolver so CLI and REST apply identical litellm.* override
-        # semantics. litellm module-level settings (drop_params etc.) are
-        # process globals and intentionally not carried per-request: the REST
-        # server runs multiple KBs in one process, so they cannot be isolated.
-        extra_headers, timeout, _ = resolve_per_request_overrides(config)
-        parallel_tool_calls, parallel_tool_calls_explicit = resolve_parallel_tool_calls(config)
+    # resolve_effective_config handles a missing KB config.yaml internally, so
+    # no existence check is needed here (matches cli._setup_llm_key's use of
+    # the same call). extra_headers/timeout/extra_body/parallel_tool_calls are
+    # NOT in GLOBAL_SCALAR_KEYS, so this only pulls in the KB's own config.yaml
+    # for them (verbatim, same as the old load_config(config_path) call).
+    config = resolve_effective_config(kb_dir)[0]
+    # Shared resolver so CLI and REST apply identical litellm.* override
+    # semantics. litellm module-level settings (drop_params etc.) are
+    # process globals and intentionally not carried per-request: the REST
+    # server runs multiple KBs in one process, so they cannot be isolated.
+    extra_headers, timeout, extra_body, _ = resolve_per_request_overrides(config)
+    if not extra_body:
+        # extra_body has no typed REST config-management surface (unlike
+        # model/language/etc — see GLOBAL_SCALAR_KEYS), so it doesn't layer
+        # through resolve_effective_config. Fall back to global.yaml's own
+        # extra_body directly: a KB-set value always wins, letting one global
+        # extra_body (e.g. Qwen3's enable_thinking toggle) apply to every KB
+        # that doesn't override it.
+        extra_body = resolve_extra_body(load_global_config())
+    parallel_tool_calls, parallel_tool_calls_explicit = resolve_parallel_tool_calls(config)
 
     return LlmCredentialBundle(
         api_key=api_key,
         base_url=base_url,
         extra_headers=extra_headers,
+        extra_body=extra_body,
         timeout=timeout,
         parallel_tool_calls=parallel_tool_calls,
         parallel_tool_calls_explicit=parallel_tool_calls_explicit,
@@ -498,6 +483,13 @@ def load_global_config() -> dict[str, Any]:
 # tracking (a KB explicit null = inherit). Mostly scalars; `entity_types` is the
 # one list-valued member — the layering rule (a non-null value wins over the
 # layer below) is type-agnostic, so a KB list overrides the global list wholesale.
+#
+# `extra_body` is deliberately NOT here: it isn't part of the typed
+# config-management REST API (GlobalConfigResponse / _KbConfigWritable), so
+# adding it would trip test_global_scalar_keys_match_api_writable_keys without
+# a matching PATCH/GET surface. It still gets a KB-wins-over-global fallback —
+# see resolve_credential_bundle / cli._setup_llm_key, which read global.yaml's
+# extra_body directly when the KB doesn't set one.
 GLOBAL_SCALAR_KEYS: tuple[str, ...] = (
     "model",
     "language",

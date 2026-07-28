@@ -109,6 +109,7 @@ def build_query_agent(
                 bundle.parallel_tool_calls if bundle.parallel_tool_calls_explicit else False
             ),
             "extra_headers": bundle.extra_headers or None,
+            "extra_body": bundle.extra_body or None,
             "extra_args": {"timeout": bundle.timeout} if bundle.timeout is not None else None,
         }
     else:

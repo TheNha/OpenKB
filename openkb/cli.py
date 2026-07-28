@@ -52,11 +52,13 @@ from openkb.agent.compiler import DEFAULT_COMPILE_CONCURRENCY, compile_long_doc
 from openkb.config import (
     DEFAULT_CONFIG,
     resolve_effective_config,
+    resolve_extra_body,
     save_config,
     load_global_config,
     register_kb,
     resolve_concurrency,
     set_extra_headers,
+    set_extra_body,
     resolve_parallel_tool_calls,
     set_parallel_tool_calls,
     set_timeout,
@@ -175,6 +177,7 @@ def _setup_llm_key(kb_dir: Path | None = None) -> None:
     # from the KB config
     provider: str | None = None
     extra_headers: dict[str, str] = {}
+    extra_body: dict[str, Any] = {}
     timeout: float | None = None
     parallel_tool_calls: bool | None = None
     parallel_tool_calls_explicit = False
@@ -189,9 +192,16 @@ def _setup_llm_key(kb_dir: Path | None = None) -> None:
         config = resolve_effective_config(kb_dir)[0]
         model = config.get("model", DEFAULT_CONFIG["model"])
         provider = _extract_provider(str(model))
-        extra_headers, timeout, litellm_settings = resolve_per_request_overrides(config)
+        extra_headers, timeout, extra_body, litellm_settings = resolve_per_request_overrides(config)
+        if not extra_body:
+            # extra_body isn't in GLOBAL_SCALAR_KEYS (no typed REST config
+            # surface for it), so resolve_effective_config doesn't layer it —
+            # fall back to global.yaml's own extra_body directly, mirroring
+            # resolve_credential_bundle's REST-path behavior.
+            extra_body = resolve_extra_body(load_global_config())
         parallel_tool_calls, parallel_tool_calls_explicit = resolve_parallel_tool_calls(config)
     set_extra_headers(extra_headers)
+    set_extra_body(extra_body)
     set_timeout(timeout)
     set_parallel_tool_calls(parallel_tool_calls, parallel_tool_calls_explicit)
     _apply_litellm_settings(litellm_settings)
@@ -527,7 +537,9 @@ def _add_single_file_locked(
             try:
                 from openkb.indexer import index_long_document
 
-                index_result = index_long_document(result.raw_path, kb_dir, doc_name=doc_name)
+                index_result = index_long_document(
+                    result.raw_path, kb_dir, doc_name=doc_name, bundle=bundle
+                )
             except Exception as exc:
                 click.echo(f"  [ERROR] Indexing failed: {exc}")
                 logger.debug("Indexing traceback:", exc_info=True)

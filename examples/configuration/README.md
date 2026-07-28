@@ -95,8 +95,17 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 #   - dataset
 #   - model
 
-# Optional: LLM / LiteLLM tuning. Keys are forwarded to LiteLLM; `timeout` and
-# `extra_headers` apply per request, the rest are set as litellm.<key>.
+# Optional: extra JSON fields merged into every LLM request body — for
+# OpenAI-compatible backends that accept non-standard params (e.g. vLLM/SGLang
+# serving Qwen3). Applies to compile, query, chat, lint, skill, AND PageIndex's
+# own indexing calls for long documents.
+# extra_body:
+#   chat_template_kwargs:
+#     enable_thinking: false   # turn off Qwen3's default "thinking" mode
+
+# Optional: LLM / LiteLLM tuning. Keys are forwarded to LiteLLM; `timeout`,
+# `extra_headers`, and `extra_body` apply per request, the rest are set as
+# litellm.<key>.
 # litellm:
 #   timeout: 1200          # per-request timeout (s); raise for slow local backends (Ollama)
 #   drop_params: true      # let LiteLLM drop params a provider rejects (e.g. Ollama)
@@ -114,6 +123,7 @@ pageindex_threshold: 20          # PDF pages threshold for PageIndex
 | `concurrency` | `null` | Caps concurrent LLM calls OpenKB makes during ingest — both PageIndex's indexing of a long document and OpenKB's own concept/entity compilation. The two never run at once for the same document, so one setting covers both. Lower it if you hit provider rate limits or "too many open files" on large PDFs. `null` lets each stage apply its own default. |
 | `parallel_tool_calls` | unset | Whether the LLM agents (query, chat, lint, skill) may call tools in parallel. Unset keeps OpenKB's per-agent defaults; `true`/`false` force allow/sequential for every agent; `null` omits the setting (provider default). **Amazon Bedrock needs `null`** (see below). |
 | `entity_types` | 7 defaults | Custom vocabulary for entity pages. `other` is always kept. |
+| `extra_body` | `{}` | Extra JSON fields merged into every LLM request body — e.g. `chat_template_kwargs: {enable_thinking: false}` to disable Qwen3's thinking mode on a self-hosted vLLM/SGLang endpoint. Forwarded to LiteLLM's `extra_body` param, including PageIndex's own indexing calls. |
 | `litellm:` | – | A pass-through block for LiteLLM. See below. |
 
 ### The `litellm:` block

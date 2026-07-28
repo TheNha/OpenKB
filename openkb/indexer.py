@@ -11,7 +11,14 @@ from typing import Any
 
 from pageindex import IndexConfig, PageIndexClient
 
-from openkb.config import resolve_concurrency, resolve_effective_config
+from openkb.config import (
+    LlmCredentialBundle,
+    get_extra_body,
+    get_extra_headers,
+    get_timeout,
+    resolve_concurrency,
+    resolve_effective_config,
+)
 from openkb.tree_renderer import render_summary_md
 
 logger = logging.getLogger(__name__)
@@ -153,7 +160,9 @@ def _write_long_doc_artifacts(
     return summary_path
 
 
-def _build_index_config(config: dict[str, Any]) -> IndexConfig:
+def _build_index_config(
+    config: dict[str, Any], bundle: LlmCredentialBundle | None = None
+) -> IndexConfig:
     """Build the PageIndex ``IndexConfig`` for local indexing.
 
     Forwards the KB's ``concurrency`` setting to PageIndex, which caps how many
@@ -162,6 +171,18 @@ def _build_index_config(config: dict[str, Any]) -> IndexConfig:
     installed PageIndex's ``IndexConfig`` declares the field, so OpenKB keeps
     working against a pinned PageIndex that predates it (``IndexConfig``
     forbids unknown kwargs).
+
+    Also forwards the LLM credential/tuning overrides (``api_key``, ``base_url``,
+    ``extra_headers``, ``extra_body``, ``timeout``) via PageIndex's
+    ``llm_params`` extension point, so PageIndex's own internal LLM calls (TOC
+    extraction, summarization) see the same OpenAI-compatible endpoint and
+    request tweaks (e.g. ``extra_body: {chat_template_kwargs: {enable_thinking:
+    false}}`` for Qwen3) as the rest of OpenKB's compile pipeline. When *bundle*
+    is ``None`` (CLI path), ``api_key``/``base_url`` are left unset here because
+    ``cli._setup_llm_key`` already exported them as process env vars that
+    PageIndex's litellm calls pick up on their own; ``extra_headers``/
+    ``extra_body``/``timeout`` still come from the process-wide runtime globals
+    so CLI-driven indexing respects the same config as REST.
     """
     kwargs: dict[str, Any] = {
         "if_add_node_text": True,
@@ -177,14 +198,46 @@ def _build_index_config(config: dict[str, Any]) -> IndexConfig:
                 "config: 'concurrency' is set but the installed PageIndex "
                 "version does not support it yet — ignoring it."
             )
+
+    llm_params: dict[str, Any] = {}
+    extra_headers = bundle.extra_headers if bundle is not None else get_extra_headers()
+    if extra_headers:
+        llm_params["extra_headers"] = extra_headers
+    extra_body = bundle.extra_body if bundle is not None else get_extra_body()
+    if extra_body:
+        llm_params["extra_body"] = extra_body
+    timeout = bundle.timeout if bundle is not None else get_timeout()
+    if timeout is not None:
+        llm_params["timeout"] = timeout
+    if bundle is not None:
+        if bundle.api_key is not None:
+            llm_params["api_key"] = bundle.api_key
+        if bundle.base_url is not None:
+            llm_params["base_url"] = bundle.base_url
+    if llm_params:
+        if "llm_params" in IndexConfig.model_fields:
+            kwargs["llm_params"] = llm_params
+        else:
+            logger.warning(
+                "config: extra_headers/extra_body/timeout/credential overrides are "
+                "set but the installed PageIndex version does not support "
+                "'llm_params' yet — ignoring them."
+            )
     return IndexConfig(**kwargs)
 
 
-def index_long_document(pdf_path: Path, kb_dir: Path, doc_name: str | None = None) -> IndexResult:
+def index_long_document(
+    pdf_path: Path,
+    kb_dir: Path,
+    doc_name: str | None = None,
+    bundle: LlmCredentialBundle | None = None,
+) -> IndexResult:
     """Index a long PDF document using PageIndex and write wiki pages.
 
     ``doc_name`` is the collision-resistant wiki name used for all written
-    artifacts; defaults to the PDF's stem for backward compatibility.
+    artifacts; defaults to the PDF's stem for backward compatibility. ``bundle``
+    is the REST API's per-KB credential bundle (``None`` on the CLI path); see
+    :func:`_build_index_config` for how it's applied.
     """
     source_name = doc_name or pdf_path.stem
     openkb_dir = kb_dir / ".openkb"
@@ -193,7 +246,7 @@ def index_long_document(pdf_path: Path, kb_dir: Path, doc_name: str | None = Non
     model: str = config.get("model", "gpt-5.4")
     pageindex_api_key = os.environ.get("PAGEINDEX_API_KEY", "")
 
-    index_config = _build_index_config(config)
+    index_config = _build_index_config(config, bundle=bundle)
 
     client = PageIndexClient(
         api_key=pageindex_api_key or None,

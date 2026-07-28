@@ -225,6 +225,47 @@ def test_litellm_block_extra_headers_win_over_legacy_toplevel(tmp_path, monkeypa
     assert get_extra_headers() == {"X-Block": "blockval"}
 
 
+def test_extra_body_falls_back_to_global(tmp_path, monkeypatch):
+    """CLI path parity with resolve_credential_bundle: a KB with no extra_body
+    of its own inherits global.yaml's extra_body via _setup_llm_key."""
+    from openkb.config import get_extra_body
+
+    _isolate_env(monkeypatch)
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "global.yaml").write_text(
+        "extra_body:\n  chat_template_kwargs:\n    enable_thinking: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_DIR", global_dir)
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_PATH", global_dir / "global.yaml")
+
+    kb_dir = tmp_path / "kb"
+    _write_kb_config(kb_dir, "model: gpt-4o-mini\n")  # no extra_body of its own
+    _setup_llm_key(kb_dir)
+    assert get_extra_body() == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_extra_body_kb_overrides_global(tmp_path, monkeypatch):
+    """A KB-set extra_body wins over global.yaml's, not merged with it."""
+    from openkb.config import get_extra_body
+
+    _isolate_env(monkeypatch)
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "global.yaml").write_text(
+        "extra_body:\n  chat_template_kwargs:\n    enable_thinking: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_DIR", global_dir)
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_PATH", global_dir / "global.yaml")
+
+    kb_dir = tmp_path / "kb"
+    _write_kb_config(kb_dir, "model: gpt-4o-mini\nextra_body:\n  custom_kwarg: true\n")
+    _setup_llm_key(kb_dir)
+    assert get_extra_body() == {"custom_kwarg": True}
+
+
 def test_litellm_block_empty_extra_headers_clears_legacy(tmp_path, monkeypatch):
     """Regression: an explicit empty `litellm: {extra_headers: {}}` CLEARS the
     legacy top-level headers, rather than silently reverting to them.

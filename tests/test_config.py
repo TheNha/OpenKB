@@ -6,6 +6,7 @@ import pytest
 from openkb.config import (
     DEFAULT_CONFIG,
     GLOBAL_SCALAR_KEYS,
+    get_extra_body,
     get_extra_headers,
     get_parallel_tool_calls,
     get_timeout,
@@ -14,6 +15,7 @@ from openkb.config import (
     registered_kbs,
     resolve_concurrency,
     resolve_effective_config,
+    resolve_extra_body,
     resolve_extra_headers,
     resolve_init_kb_dir,
     resolve_litellm_settings,
@@ -22,6 +24,7 @@ from openkb.config import (
     resolve_timeout,
     save_config,
     save_global_config,
+    set_extra_body,
     set_extra_headers,
     set_parallel_tool_calls,
     set_timeout,
@@ -92,20 +95,24 @@ def test_parallel_tool_calls_stash_default_is_unset():
 
 def test_resolve_model_settings_uses_own_default_when_unset():
     set_extra_headers({})
+    set_extra_body({})
     set_timeout(None)
     set_parallel_tool_calls(None, False)
     assert resolve_model_settings() == {
         "extra_headers": None,
+        "extra_body": None,
         "extra_args": None,
         "parallel_tool_calls": False,  # the function's own default
     }
     assert resolve_model_settings(default_parallel_tool_calls=None) == {
         "extra_headers": None,
+        "extra_body": None,
         "extra_args": None,
         "parallel_tool_calls": None,
     }
     assert resolve_model_settings(default_parallel_tool_calls=True) == {
         "extra_headers": None,
+        "extra_body": None,
         "extra_args": None,
         "parallel_tool_calls": True,
     }
@@ -116,11 +123,13 @@ def test_resolve_model_settings_explicit_value_overrides_every_default():
     # caller would otherwise apply — the whole point of the escape hatch is
     # that it works uniformly, regardless of which agent is asking.
     set_extra_headers({"X-A": "1"})
+    set_extra_body({"chat_template_kwargs": {"enable_thinking": False}})
     set_timeout(1200.0)
     set_parallel_tool_calls(None, True)  # explicit null: omit, for everyone
     for default in (False, True, None):
         assert resolve_model_settings(default_parallel_tool_calls=default) == {
             "extra_headers": {"X-A": "1"},
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
             "extra_args": {"timeout": 1200.0},
             "parallel_tool_calls": None,
         }
@@ -283,6 +292,34 @@ def test_extra_headers_stash_roundtrip_and_isolation():
     assert get_extra_headers() == {"A": "1"}
     set_extra_headers({})
     assert get_extra_headers() == {}
+
+
+# --- extra_body ----------------------------------------------------------------
+
+
+def test_resolve_extra_body_absent_returns_empty():
+    assert resolve_extra_body({}) == {}
+
+
+def test_resolve_extra_body_valid_mapping():
+    config = {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+    assert resolve_extra_body(config) == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_resolve_extra_body_non_mapping_ignored():
+    assert resolve_extra_body({"extra_body": ["not", "a", "mapping"]}) == {}
+    assert resolve_extra_body({"extra_body": "not-a-mapping"}) == {}
+
+
+def test_extra_body_stash_roundtrip_and_isolation():
+    set_extra_body({"chat_template_kwargs": {"enable_thinking": False}})
+    got = get_extra_body()
+    assert got == {"chat_template_kwargs": {"enable_thinking": False}}
+    # Mutating the returned copy must not affect the stash.
+    got["extra_key"] = "2"
+    assert get_extra_body() == {"chat_template_kwargs": {"enable_thinking": False}}
+    set_extra_body({})
+    assert get_extra_body() == {}
 
 
 # --- timeout -----------------------------------------------------------------
