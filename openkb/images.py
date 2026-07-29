@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import re
 import shutil
@@ -21,6 +22,35 @@ _RELATIVE_RE = re.compile(r"!\[([^\]]*)\]\((?!https?://|data:)([^)]+)\)")
 
 # Minimum pixel dimension — skip icons, bullets, and tiny artifacts
 _MIN_IMAGE_DIM = 32
+
+# A raster image whose exact byte content recurs on this many (or more)
+# distinct pages is almost certainly a running header/footer logo or
+# watermark, not page content — size alone doesn't catch these (a letterhead
+# logo is often well above _MIN_IMAGE_DIM).
+_REPEAT_MIN_PAGES = 3
+
+
+def _repeated_image_hashes(doc: pymupdf.Document, min_dim: int = _MIN_IMAGE_DIM) -> set[str]:
+    """MD5 hashes of raster images recurring on >= _REPEAT_MIN_PAGES distinct pages.
+
+    A cheap pre-pass over ``get_text("dict")`` (no Pixmap rendering) so callers
+    can skip these blocks in their main extraction loop. Two occurrences on the
+    *same* page count once — repetition is measured across pages.
+    """
+    pages_seen: dict[str, set[int]] = {}
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] != 1:  # not an image block
+                continue
+            if block.get("width", 0) < min_dim or block.get("height", 0) < min_dim:
+                continue
+            image_bytes = block.get("image")
+            if not image_bytes:
+                continue
+            digest = hashlib.md5(image_bytes).hexdigest()
+            pages_seen.setdefault(digest, set()).add(page_idx + 1)
+    return {digest for digest, pages in pages_seen.items() if len(pages) >= _REPEAT_MIN_PAGES}
 
 
 def md_image_ref(alt: str, doc_name: str, filename: str) -> str:
@@ -44,6 +74,10 @@ def extract_pdf_images(pdf_path: Path, doc_name: str, images_dir: Path) -> dict[
     as PNG. This captures both embedded bitmaps *and* vector-rendered figures
     that ``get_images()`` would miss.
 
+    Images recurring byte-for-byte on >= _REPEAT_MIN_PAGES pages (running
+    header/footer logos, watermarks) are dropped everywhere, not just where
+    they're small — see :func:`_repeated_image_hashes`.
+
     Returns a mapping of page_number (1-based) → list of image paths. Paths
     are wiki-root-relative (``sources/images/...``) — internal metadata for
     tools that resolve against the wiki root, not note-rendered markdown.
@@ -53,6 +87,7 @@ def extract_pdf_images(pdf_path: Path, doc_name: str, images_dir: Path) -> dict[
     img_counter = 0
 
     with pymupdf.open(str(pdf_path)) as doc:
+        repeated = _repeated_image_hashes(doc)
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             page_num = page_idx + 1
@@ -68,6 +103,8 @@ def extract_pdf_images(pdf_path: Path, doc_name: str, images_dir: Path) -> dict[
 
                 image_bytes = block.get("image")
                 if not image_bytes:
+                    continue
+                if hashlib.md5(image_bytes).hexdigest() in repeated:
                     continue
 
                 try:
@@ -96,12 +133,17 @@ def convert_pdf_to_pages(pdf_path: Path, doc_name: str, images_dir: Path) -> lis
     ``sources/images/...`` paths — these pages land in ``sources/<doc>.json``
     (never rendered from a note), and both ``get_wiki_page_content`` and
     ``read_wiki_image`` resolve them against the wiki root.
+
+    Images recurring byte-for-byte on >= _REPEAT_MIN_PAGES pages (running
+    header/footer logos, watermarks) are dropped everywhere — see
+    :func:`_repeated_image_hashes`.
     """
     images_dir.mkdir(parents=True, exist_ok=True)
     pages: list[dict] = []
     img_counter = 0
 
     with pymupdf.open(str(pdf_path)) as doc:
+        repeated = _repeated_image_hashes(doc)
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             page_num = page_idx + 1
@@ -123,6 +165,8 @@ def convert_pdf_to_pages(pdf_path: Path, doc_name: str, images_dir: Path) -> lis
                         continue
                     image_bytes = block.get("image")
                     if not image_bytes:
+                        continue
+                    if hashlib.md5(image_bytes).hexdigest() in repeated:
                         continue
                     try:
                         pix = pymupdf.Pixmap(image_bytes)
@@ -156,6 +200,10 @@ def convert_pdf_with_images(pdf_path: Path, doc_name: str, images_dir: Path) -> 
     ``![image](images/{doc_name}/...)`` link inline — preserving the
     original position in the document.
 
+    Images recurring byte-for-byte on >= _REPEAT_MIN_PAGES pages (running
+    header/footer logos, watermarks) are dropped everywhere — see
+    :func:`_repeated_image_hashes`.
+
     Returns the full markdown string.
     """
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -163,6 +211,7 @@ def convert_pdf_with_images(pdf_path: Path, doc_name: str, images_dir: Path) -> 
     img_counter = 0
 
     with pymupdf.open(str(pdf_path)) as doc:
+        repeated = _repeated_image_hashes(doc)
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             page_num = page_idx + 1
@@ -183,6 +232,8 @@ def convert_pdf_with_images(pdf_path: Path, doc_name: str, images_dir: Path) -> 
                         continue
                     image_bytes = block.get("image")
                     if not image_bytes:
+                        continue
+                    if hashlib.md5(image_bytes).hexdigest() in repeated:
                         continue
                     try:
                         pix = pymupdf.Pixmap(image_bytes)

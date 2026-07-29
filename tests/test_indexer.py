@@ -47,6 +47,20 @@ class _FakeIndexConfigWithoutConcurrency:
         self.__dict__.update(kwargs)
 
 
+class _FakeIndexConfigWithLlmParams:
+    """Stand-in for a PageIndex ``IndexConfig`` that declares ``llm_params``."""
+
+    model_fields = {
+        "if_add_node_text": None,
+        "if_add_node_summary": None,
+        "if_add_doc_description": None,
+        "llm_params": None,
+    }
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
 class TestBuildIndexConfig:
     def test_sets_base_flags(self):
         cfg = _build_index_config({})
@@ -93,6 +107,33 @@ class TestBuildIndexConfig:
         with caplog.at_level(logging.WARNING, logger="openkb.indexer"):
             _build_index_config({"concurrency": 8})
         assert caplog.text == ""
+
+
+class TestBuildIndexConfigTemperature:
+    """PageIndex's own internal LLM calls (TOC extraction, summarization) are
+    part of ingest, so they must pick up ``ingest_temperature`` — never
+    ``query_temperature`` — via the ``llm_params`` extension point."""
+
+    def test_forwards_ingest_temperature_from_process_stash(self, monkeypatch):
+        from openkb.config import set_ingest_temperature
+
+        monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithLlmParams)
+        set_ingest_temperature(0.3)
+        cfg = _build_index_config({})
+        assert cfg.llm_params["temperature"] == 0.3
+
+    def test_forwards_ingest_temperature_from_bundle_not_query(self, monkeypatch):
+        from openkb.config import LlmCredentialBundle
+
+        monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithLlmParams)
+        bundle = LlmCredentialBundle(ingest_temperature=0.2, query_temperature=0.9)
+        cfg = _build_index_config({}, bundle=bundle)
+        assert cfg.llm_params["temperature"] == 0.2
+
+    def test_omits_temperature_when_unset(self, monkeypatch):
+        monkeypatch.setattr("openkb.indexer.IndexConfig", _FakeIndexConfigWithLlmParams)
+        cfg = _build_index_config({})
+        assert "temperature" not in getattr(cfg, "llm_params", {})
 
 
 class TestNormalizePageContent:

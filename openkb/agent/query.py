@@ -45,6 +45,11 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
    (e.g. sources/images/doc/file.png). Pass either form as seen to the
    get_image tool — it accepts both.
 7. Synthesize a clear, concise, well-cited answer grounded in wiki content.
+   If a figure, chart, or diagram you looked at (via get_image) or saw
+   referenced in the source content is directly relevant to the answer,
+   include its Markdown image reference (e.g. ![image](images/doc/file.png)
+   or ![image](sources/images/doc/file.png)) inline, exactly as it appeared
+   in the source, so the user can see it — don't just describe it in prose.
 
 Answer based only on wiki content. Be concise.
 Before each tool call, output one short sentence explaining the reason.
@@ -111,6 +116,7 @@ def build_query_agent(
             "extra_headers": bundle.extra_headers or None,
             "extra_body": bundle.extra_body or None,
             "extra_args": {"timeout": bundle.timeout} if bundle.timeout is not None else None,
+            "temperature": bundle.query_temperature,
         }
     else:
         model_settings = resolve_model_settings()
@@ -228,7 +234,10 @@ def build_chat_agent(
     ``<kb>/skills/``, ``~/.openkb/skills/``, ``~/.claude/skills/`` for
     ``SKILL.md`` files. Any found skill is exposed to the agent via
     ``ShellTool.environment.skills`` so the model can ``cat`` the skill body
-    and follow its instructions when the user's request matches.
+    and follow its instructions when the user's request matches. Set
+    ``enable_skills: false`` in config.yaml/global.yaml to skip this
+    entirely (KB config wins over global; unset means enabled — unchanged
+    behavior for existing KBs).
     """
     wiki_root = str(kb_dir / "wiki")
     kb_root = str(kb_dir)
@@ -259,9 +268,20 @@ def build_chat_agent(
     # are OpenAI Responses-API hosted tools; LiteLLM routes through
     # ChatCompletions which rejects hosted tools. So we use plain
     # ``function_tool`` primitives that work with any LiteLLM-routed model.
+    # ``enable_skills: false`` (KB config.yaml, falling back to global.yaml)
+    # skips scanning/exposing skills entirely — for KBs used purely for wiki
+    # Q&A, where the deck/report-generation skills are irrelevant noise in
+    # every chat turn's system prompt.
     from openkb.agent.skills import scan_local_skills
+    from openkb.config import load_global_config, resolve_effective_config
 
-    skills = scan_local_skills(kb_dir)
+    kb_config = resolve_effective_config(kb_dir)[0]
+    enable_skills = kb_config.get("enable_skills")
+    if enable_skills is None:
+        enable_skills = load_global_config().get("enable_skills")
+    enable_skills = True if not isinstance(enable_skills, bool) else enable_skills
+
+    skills = scan_local_skills(kb_dir) if enable_skills else []
     skill_index = {s["name"]: s for s in skills}
 
     if skill_index:

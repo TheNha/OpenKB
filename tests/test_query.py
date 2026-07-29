@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openkb.agent.query import build_query_agent, run_query
+from openkb.agent.query import build_chat_agent, build_query_agent, run_query
 from openkb.schema import SCHEMA_MD
 
 
@@ -80,6 +80,18 @@ def test_query_strategy_mentions_entities():
 
     text = query_mod._QUERY_INSTRUCTIONS_TEMPLATE
     assert "entities/" in text
+
+
+def test_query_strategy_tells_agent_to_echo_relevant_images():
+    """Retrieved page content includes image markdown, but the agent used to
+    only be told to *view* figures (get_image), never to include their
+    Markdown reference back in the answer — so relevant images never reached
+    the user in chat. Instructions must tell it to echo the reference."""
+    from openkb.agent import query as query_mod
+
+    text = query_mod._QUERY_INSTRUCTIONS_TEMPLATE
+    assert "![image]" in text
+    assert "include" in text.lower() and "image" in text.lower()
 
 
 class TestResolveToolCallId:
@@ -276,6 +288,116 @@ class TestQueryAgentTimeout:
     def test_no_timeout_by_default(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
         assert agent.model_settings.extra_args is None
+
+
+class TestQueryAgentTemperature:
+    """Config-driven temperature reaches the agents-SDK model settings."""
+
+    def test_temperature_applied_from_stash(self, tmp_path):
+        from openkb.config import set_query_temperature
+
+        set_query_temperature(0.3)
+        agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
+        assert agent.model_settings.temperature == 0.3
+
+    def test_no_temperature_by_default(self, tmp_path):
+        agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
+        assert agent.model_settings.temperature is None
+
+    def test_ingest_temperature_stash_does_not_leak_into_query(self, tmp_path):
+        """The two phases are independent knobs — setting one must not affect
+        the other."""
+        from openkb.config import set_ingest_temperature
+
+        set_ingest_temperature(0.9)
+        agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
+        assert agent.model_settings.temperature is None
+
+    def test_bundle_temperature_used_over_process_global(self, tmp_path):
+        """REST requests use the bundle's query_temperature, not another KB's stash."""
+        from openkb.config import LlmCredentialBundle, set_query_temperature
+
+        set_query_temperature(0.9)
+        bundle = LlmCredentialBundle(query_temperature=0.1)
+        agent = build_query_agent(str(tmp_path), "gpt-4o-mini", bundle=bundle)
+        assert agent.model_settings.temperature == 0.1
+
+
+class TestBuildChatAgentEnableSkills:
+    """``enable_skills: false`` (KB config, falling back to global.yaml) must
+    skip skill discovery — list_skills/read_skill tools and the "Available
+    skills" prompt addendum — for KBs used purely for wiki Q&A."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch, tmp_path):
+        # Neutralize bundled + user-home skill roots so only what each test
+        # explicitly writes under the KB's own skills/ is ever discovered.
+        fake_home = tmp_path / "isolated-home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("openkb.agent.skills.BUNDLED_SKILL_ROOTS", ())
+        # Isolate global.yaml so the real dev-machine config never leaks in.
+        global_dir = tmp_path / "global-config"
+        global_dir.mkdir()
+        monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_DIR", global_dir)
+        monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_PATH", global_dir / "global.yaml")
+
+    def _write_skill(self, kb_dir):
+        sk_dir = kb_dir / "skills" / "demo"
+        sk_dir.mkdir(parents=True)
+        (sk_dir / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: A test skill.\n---\ninstructions",
+            encoding="utf-8",
+        )
+
+    def _write_kb_config(self, kb_dir, config: dict):
+        import yaml
+
+        openkb_dir = kb_dir / ".openkb"
+        openkb_dir.mkdir(parents=True, exist_ok=True)
+        (openkb_dir / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    def test_skills_exposed_by_default(self, tmp_path):
+        self._write_skill(tmp_path)
+        agent = build_chat_agent(tmp_path, "gpt-4o-mini")
+        names = {t.name for t in agent.tools}
+        assert "list_skills" in names
+        assert "read_skill" in names
+
+    def test_kb_disables_skills(self, tmp_path):
+        self._write_skill(tmp_path)
+        self._write_kb_config(tmp_path, {"enable_skills": False})
+        agent = build_chat_agent(tmp_path, "gpt-4o-mini")
+        names = {t.name for t in agent.tools}
+        assert "list_skills" not in names
+        assert "read_skill" not in names
+        # write_file must still be there — enable_skills only gates discovery.
+        assert "write_file" in names
+
+    def test_kb_disables_skills_removes_prompt_addendum(self, tmp_path):
+        self._write_skill(tmp_path)
+        self._write_kb_config(tmp_path, {"enable_skills": False})
+        agent = build_chat_agent(tmp_path, "gpt-4o-mini")
+        assert "Available skills" not in (agent.instructions or "")
+
+    def test_global_disables_skills_for_kb_without_own_setting(self, tmp_path, monkeypatch):
+        from openkb.config import save_global_config
+
+        self._write_skill(tmp_path)
+        save_global_config({"enable_skills": False})
+        agent = build_chat_agent(tmp_path, "gpt-4o-mini")
+        names = {t.name for t in agent.tools}
+        assert "list_skills" not in names
+
+    def test_kb_setting_overrides_global(self, tmp_path):
+        from openkb.config import save_global_config
+
+        self._write_skill(tmp_path)
+        save_global_config({"enable_skills": False})
+        self._write_kb_config(tmp_path, {"enable_skills": True})
+        agent = build_chat_agent(tmp_path, "gpt-4o-mini")
+        names = {t.name for t in agent.tools}
+        assert "list_skills" in names
 
 
 class TestBuildRunConfigFromBundle:

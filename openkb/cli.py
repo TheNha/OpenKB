@@ -51,16 +51,19 @@ from dotenv import load_dotenv
 from openkb.agent.compiler import DEFAULT_COMPILE_CONCURRENCY, compile_long_doc
 from openkb.config import (
     DEFAULT_CONFIG,
+    resolve_effective_concurrency,
     resolve_effective_config,
     resolve_extra_body,
+    resolve_temperature,
     save_config,
     load_global_config,
     register_kb,
-    resolve_concurrency,
     set_extra_headers,
     set_extra_body,
     resolve_parallel_tool_calls,
+    set_ingest_temperature,
     set_parallel_tool_calls,
+    set_query_temperature,
     set_timeout,
     resolve_per_request_overrides,
 )
@@ -179,6 +182,8 @@ def _setup_llm_key(kb_dir: Path | None = None) -> None:
     extra_headers: dict[str, str] = {}
     extra_body: dict[str, Any] = {}
     timeout: float | None = None
+    ingest_temperature: float | None = None
+    query_temperature: float | None = None
     parallel_tool_calls: bool | None = None
     parallel_tool_calls_explicit = False
     litellm_settings: dict = {}
@@ -199,10 +204,21 @@ def _setup_llm_key(kb_dir: Path | None = None) -> None:
             # fall back to global.yaml's own extra_body directly, mirroring
             # resolve_credential_bundle's REST-path behavior.
             extra_body = resolve_extra_body(load_global_config())
+        # ingest_temperature/query_temperature aren't in GLOBAL_SCALAR_KEYS
+        # either — same global.yaml-only fallback as extra_body, per phase.
+        global_config = load_global_config()
+        ingest_temperature = resolve_temperature(config, "ingest_temperature")
+        if ingest_temperature is None:
+            ingest_temperature = resolve_temperature(global_config, "ingest_temperature")
+        query_temperature = resolve_temperature(config, "query_temperature")
+        if query_temperature is None:
+            query_temperature = resolve_temperature(global_config, "query_temperature")
         parallel_tool_calls, parallel_tool_calls_explicit = resolve_parallel_tool_calls(config)
     set_extra_headers(extra_headers)
     set_extra_body(extra_body)
     set_timeout(timeout)
+    set_ingest_temperature(ingest_temperature)
+    set_query_temperature(query_temperature)
     set_parallel_tool_calls(parallel_tool_calls, parallel_tool_calls_explicit)
     _apply_litellm_settings(litellm_settings)
 
@@ -570,7 +586,8 @@ def _add_single_file_locked(
                     kb_dir,
                     model,
                     doc_description=index_result.description,
-                    max_concurrency=resolve_concurrency(config) or DEFAULT_COMPILE_CONCURRENCY,
+                    max_concurrency=resolve_effective_concurrency(config)
+                    or DEFAULT_COMPILE_CONCURRENCY,
                     bundle=bundle,
                 ),
                 label=f"Compiling long doc (doc_id={index_result.doc_id})",
@@ -585,7 +602,8 @@ def _add_single_file_locked(
                     source_path,
                     kb_dir,
                     model,
-                    max_concurrency=resolve_concurrency(config) or DEFAULT_COMPILE_CONCURRENCY,
+                    max_concurrency=resolve_effective_concurrency(config)
+                    or DEFAULT_COMPILE_CONCURRENCY,
                     bundle=bundle,
                 ),
                 label="Compiling short doc",
@@ -779,7 +797,8 @@ def import_from_pageindex_cloud(doc_id: str, kb_dir: Path) -> Literal["added", "
                         kb_dir,
                         model,
                         doc_description=cloud.description,
-                        max_concurrency=resolve_concurrency(config) or DEFAULT_COMPILE_CONCURRENCY,
+                        max_concurrency=resolve_effective_concurrency(config)
+                        or DEFAULT_COMPILE_CONCURRENCY,
                     ),
                     label=f"Compiling imported doc (doc_id={doc_id})",
                 )
@@ -1981,7 +2000,7 @@ def recompile(ctx, doc_name, all_docs, dry_run, yes, refresh_schema):
     _setup_llm_key(kb_dir)
     config = resolve_effective_config(kb_dir)[0]
     model: str = config.get("model", DEFAULT_CONFIG["model"])
-    max_concurrency = resolve_concurrency(config) or DEFAULT_COMPILE_CONCURRENCY
+    max_concurrency = resolve_effective_concurrency(config) or DEFAULT_COMPILE_CONCURRENCY
 
     # Import lazily and reference via the module so tests can patch
     # ``openkb.agent.compiler.compile_*`` and see the call.

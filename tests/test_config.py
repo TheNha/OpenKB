@@ -8,12 +8,15 @@ from openkb.config import (
     GLOBAL_SCALAR_KEYS,
     get_extra_body,
     get_extra_headers,
+    get_ingest_temperature,
     get_parallel_tool_calls,
+    get_query_temperature,
     get_timeout,
     kb_root_dir,
     load_config,
     registered_kbs,
     resolve_concurrency,
+    resolve_effective_concurrency,
     resolve_effective_config,
     resolve_extra_body,
     resolve_extra_headers,
@@ -21,12 +24,15 @@ from openkb.config import (
     resolve_litellm_settings,
     resolve_model_settings,
     resolve_parallel_tool_calls,
+    resolve_temperature,
     resolve_timeout,
     save_config,
     save_global_config,
     set_extra_body,
     set_extra_headers,
+    set_ingest_temperature,
     set_parallel_tool_calls,
+    set_query_temperature,
     set_timeout,
 )
 
@@ -97,24 +103,28 @@ def test_resolve_model_settings_uses_own_default_when_unset():
     set_extra_headers({})
     set_extra_body({})
     set_timeout(None)
+    set_query_temperature(None)
     set_parallel_tool_calls(None, False)
     assert resolve_model_settings() == {
         "extra_headers": None,
         "extra_body": None,
         "extra_args": None,
         "parallel_tool_calls": False,  # the function's own default
+        "temperature": None,
     }
     assert resolve_model_settings(default_parallel_tool_calls=None) == {
         "extra_headers": None,
         "extra_body": None,
         "extra_args": None,
         "parallel_tool_calls": None,
+        "temperature": None,
     }
     assert resolve_model_settings(default_parallel_tool_calls=True) == {
         "extra_headers": None,
         "extra_body": None,
         "extra_args": None,
         "parallel_tool_calls": True,
+        "temperature": None,
     }
 
 
@@ -125,6 +135,7 @@ def test_resolve_model_settings_explicit_value_overrides_every_default():
     set_extra_headers({"X-A": "1"})
     set_extra_body({"chat_template_kwargs": {"enable_thinking": False}})
     set_timeout(1200.0)
+    set_query_temperature(0.3)
     set_parallel_tool_calls(None, True)  # explicit null: omit, for everyone
     for default in (False, True, None):
         assert resolve_model_settings(default_parallel_tool_calls=default) == {
@@ -132,6 +143,7 @@ def test_resolve_model_settings_explicit_value_overrides_every_default():
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
             "extra_args": {"timeout": 1200.0},
             "parallel_tool_calls": None,
+            "temperature": 0.3,
         }
 
     set_parallel_tool_calls(True, True)  # explicit true: allow parallel, for everyone
@@ -203,6 +215,23 @@ def test_resolve_concurrency_none_is_silent(caplog):
     with caplog.at_level(logging.WARNING, logger="openkb.config"):
         assert resolve_concurrency({"concurrency": None}) is None
     assert caplog.text == ""
+
+
+def test_effective_concurrency_kb_value_wins(_isolated_global):
+    save_global_config({"concurrency": 3})
+    assert resolve_effective_concurrency({"concurrency": 10}) == 10
+
+
+def test_effective_concurrency_falls_back_to_global(_isolated_global):
+    # concurrency isn't in GLOBAL_SCALAR_KEYS, so resolve_effective_config
+    # doesn't layer it in — resolve_effective_concurrency must fall back to
+    # global.yaml directly for a KB that doesn't set its own.
+    save_global_config({"concurrency": 7})
+    assert resolve_effective_concurrency({}) == 7
+
+
+def test_effective_concurrency_none_when_neither_set(_isolated_global):
+    assert resolve_effective_concurrency({}) is None
 
 
 def test_load_missing_file_returns_defaults(tmp_path):
@@ -366,6 +395,82 @@ def test_timeout_stash_roundtrip_and_reset():
     assert get_timeout() == 1200.0
     set_timeout(None)
     assert get_timeout() is None
+
+
+# --- temperature ---------------------------------------------------------
+
+
+def test_temperature_not_in_default_config():
+    # Like timeout/extra_headers/parallel_tool_calls, ingest_temperature and
+    # query_temperature stay out of DEFAULT_CONFIG — resolve_temperature reads
+    # them via .get(), so an absent key resolves to None (use the provider's
+    # default) without relying on load_config's merge.
+    assert "ingest_temperature" not in DEFAULT_CONFIG
+    assert "query_temperature" not in DEFAULT_CONFIG
+
+
+def test_resolve_temperature_absent_returns_none():
+    assert resolve_temperature({}) is None
+
+
+def test_resolve_temperature_int_and_float():
+    assert resolve_temperature({"temperature": 1}) == 1.0
+    assert resolve_temperature({"temperature": 0.3}) == 0.3
+
+
+def test_resolve_temperature_zero_is_valid():
+    # 0 is a legitimate (deterministic) temperature, unlike timeout=0.
+    assert resolve_temperature({"temperature": 0}) == 0.0
+
+
+def test_resolve_temperature_numeric_string_coerced():
+    assert resolve_temperature({"temperature": "0.7"}) == 0.7
+
+
+def test_resolve_temperature_rejects_negative():
+    assert resolve_temperature({"temperature": -0.1}) is None
+
+
+def test_resolve_temperature_rejects_bool():
+    assert resolve_temperature({"temperature": True}) is None
+
+
+def test_resolve_temperature_rejects_non_numeric():
+    assert resolve_temperature({"temperature": "hot"}) is None
+    assert resolve_temperature({"temperature": [0.5]}) is None
+
+
+def test_resolve_temperature_rejects_nan_and_inf():
+    assert resolve_temperature({"temperature": float("inf")}) is None
+    assert resolve_temperature({"temperature": float("nan")}) is None
+
+
+def test_resolve_temperature_custom_key():
+    # Ingest and query use distinct config keys sharing this one validator.
+    assert resolve_temperature({"ingest_temperature": 0.2}, "ingest_temperature") == 0.2
+    assert resolve_temperature({"ingest_temperature": 0.2}, "query_temperature") is None
+    assert resolve_temperature({"query_temperature": 0.9}, "query_temperature") == 0.9
+
+
+def test_ingest_temperature_stash_roundtrip_and_reset():
+    set_ingest_temperature(0.4)
+    assert get_ingest_temperature() == 0.4
+    set_ingest_temperature(None)
+    assert get_ingest_temperature() is None
+
+
+def test_query_temperature_stash_roundtrip_and_reset():
+    set_query_temperature(0.6)
+    assert get_query_temperature() == 0.6
+    set_query_temperature(None)
+    assert get_query_temperature() is None
+
+
+def test_ingest_and_query_temperature_stashes_are_independent():
+    set_ingest_temperature(0.1)
+    set_query_temperature(0.8)
+    assert get_ingest_temperature() == 0.1
+    assert get_query_temperature() == 0.8
 
 
 def test_resolve_litellm_settings_absent_returns_empty():

@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import base64
 
-from openkb.images import copy_relative_images, extract_base64_images
+import pymupdf
+
+from openkb.images import (
+    convert_pdf_to_pages,
+    convert_pdf_with_images,
+    copy_relative_images,
+    extract_base64_images,
+    extract_pdf_images,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -247,3 +255,89 @@ class TestNoteRelativeResolution:
 
         for rel in self._link_paths(result):
             assert (note.parent / rel).exists(), rel
+
+
+# ---------------------------------------------------------------------------
+# Repeated header/footer logo filtering (PDF extractors)
+# ---------------------------------------------------------------------------
+
+
+def _make_pixmap(width: int, height: int, color: tuple[int, int, int]) -> pymupdf.Pixmap:
+    samples = bytes(color) * width * height
+    return pymupdf.Pixmap(pymupdf.csRGB, width, height, samples, False)
+
+
+def _make_pdf_with_repeated_logo(path, n_pages: int = 4):
+    """A synthetic PDF: the same 60x60 "logo" pixmap on every page (byte-for-byte
+    identical, as a real letterhead logo would be), plus a distinct 100x100
+    "figure" pixmap on page 2 only. Both are above _MIN_IMAGE_DIM."""
+    logo = _make_pixmap(60, 60, (200, 0, 0))
+    figure = _make_pixmap(100, 100, (0, 200, 0))
+
+    doc = pymupdf.open()
+    for i in range(n_pages):
+        page = doc.new_page(width=300, height=400)
+        page.insert_image(pymupdf.Rect(10, 10, 70, 70), pixmap=logo)
+        if i == 1:
+            page.insert_image(pymupdf.Rect(10, 100, 110, 200), pixmap=figure)
+    doc.save(str(path))
+    doc.close()
+
+
+class TestRepeatedImageFiltering:
+    """A logo/watermark repeated byte-for-byte across many pages is a running
+    header/footer artifact, not page content — it must be dropped everywhere,
+    even though it's well above _MIN_IMAGE_DIM (unlike icons/bullets)."""
+
+    def test_convert_pdf_to_pages_drops_repeated_logo(self, tmp_path):
+        pdf_path = tmp_path / "doc.pdf"
+        _make_pdf_with_repeated_logo(pdf_path)
+        images_dir = tmp_path / "images"
+
+        pages = convert_pdf_to_pages(pdf_path, "doc", images_dir)
+
+        all_images = [img["path"] for p in pages for img in p["images"]]
+        assert len(all_images) == 1, all_images
+        assert "![image](" not in pages[0]["content"]
+        assert "![image](" in pages[1]["content"]
+        assert len(list(images_dir.glob("*.png"))) == 1
+
+    def test_convert_pdf_with_images_drops_repeated_logo(self, tmp_path):
+        pdf_path = tmp_path / "doc.pdf"
+        _make_pdf_with_repeated_logo(pdf_path)
+        images_dir = tmp_path / "images"
+
+        markdown = convert_pdf_with_images(pdf_path, "doc", images_dir)
+
+        assert markdown.count("![image](") == 1
+        assert len(list(images_dir.glob("*.png"))) == 1
+
+    def test_extract_pdf_images_drops_repeated_logo(self, tmp_path):
+        pdf_path = tmp_path / "doc.pdf"
+        _make_pdf_with_repeated_logo(pdf_path)
+        images_dir = tmp_path / "images"
+
+        page_images = extract_pdf_images(pdf_path, "doc", images_dir)
+
+        all_images = [p for imgs in page_images.values() for p in imgs]
+        assert len(all_images) == 1, all_images
+        assert list(page_images.keys()) == [2]
+
+    def test_non_repeated_images_are_kept(self, tmp_path):
+        """Two distinct large images, each appearing only once, must both survive —
+        the filter targets exact-byte repetition, not "any image on multiple pages"."""
+        pdf_path = tmp_path / "doc.pdf"
+        img_a = _make_pixmap(100, 100, (10, 20, 30))
+        img_b = _make_pixmap(100, 100, (40, 50, 60))
+        doc = pymupdf.open()
+        for i, img in enumerate([img_a, img_b]):
+            page = doc.new_page(width=300, height=400)
+            page.insert_image(pymupdf.Rect(10, 10, 110, 110), pixmap=img)
+        doc.save(str(pdf_path))
+        doc.close()
+        images_dir = tmp_path / "images"
+
+        pages = convert_pdf_to_pages(pdf_path, "doc", images_dir)
+
+        all_images = [img["path"] for p in pages for img in p["images"]]
+        assert len(all_images) == 2, all_images

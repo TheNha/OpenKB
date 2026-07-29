@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { useLocation, useNavigate, useParams } from "react-router"
 import { useTranslation, Trans } from "react-i18next"
 import type { TFunction } from "i18next"
@@ -158,10 +158,12 @@ function AssistantMessage({
   turn,
   onOpen,
   onOpenArtifact,
+  resolveImageSrc,
 }: {
   turn: ChatTurnState
   onOpen: (s: Source) => void
   onOpenArtifact: (a: Artifact) => void
+  resolveImageSrc?: (rawSrc: string) => string | null
 }) {
   const { t } = useTranslation("chat")
   const streaming = !turn.done
@@ -191,6 +193,7 @@ function AssistantMessage({
                   <MarkdownView
                     source={step.text}
                     onWikiLink={(target) => onOpen({ kind: "page", label: target, path: target })}
+                    resolveImageSrc={resolveImageSrc}
                   />
                 </div>
               ) : null
@@ -268,6 +271,19 @@ export default function ChatSession() {
   const [kb, setKbState] = useState<string>(location.state?.kbId ?? "")
   const kbRef = useRef(kb)
   const setKb = (v: string) => { kbRef.current = v; setKbState(v) }
+
+  // Map a source image ref surfaced by the assistant to the authed image
+  // endpoint, same normalization as the Documents pane (KbDetail.tsx).
+  const resolveChatImageSrc = useCallback(
+    (rawSrc: string): string | null => {
+      let rel: string | null = null
+      if (rawSrc.startsWith("sources/images/")) rel = rawSrc
+      else if (rawSrc.startsWith("images/")) rel = `sources/${rawSrc}`
+      if (!rel) return null
+      return `/api/v1/document/image?kb=${encodeURIComponent(kb)}&path=${encodeURIComponent(rel)}`
+    },
+    [kb],
+  )
 
   const sessionIdRef = useRef<string | null>(id && id !== "new" ? id : null)
 
@@ -673,6 +689,7 @@ export default function ChatSession() {
                 turn={m.turn}
                 onOpen={openSource}
                 onOpenArtifact={setPanelArtifact}
+                resolveImageSrc={resolveChatImageSrc}
               />
             ),
           )}

@@ -34,6 +34,7 @@ from openkb.config import (
     DEFAULT_ENTITY_TYPES,
     get_extra_body,
     get_extra_headers,
+    get_ingest_temperature,
     get_timeout,
     resolve_entity_types,
 )
@@ -418,6 +419,9 @@ def _llm_call(
     timeout = bundle.timeout if bundle is not None else get_timeout()
     if timeout is not None:
         kwargs.setdefault("timeout", timeout)
+    temperature = bundle.ingest_temperature if bundle is not None else get_ingest_temperature()
+    if temperature is not None:
+        kwargs.setdefault("temperature", temperature)
     if bundle is not None:
         kwargs.setdefault("api_key", bundle.api_key)
         kwargs.setdefault("base_url", bundle.base_url)
@@ -464,6 +468,9 @@ async def _llm_call_async(
     timeout = bundle.timeout if bundle is not None else get_timeout()
     if timeout is not None:
         kwargs.setdefault("timeout", timeout)
+    temperature = bundle.ingest_temperature if bundle is not None else get_ingest_temperature()
+    if temperature is not None:
+        kwargs.setdefault("temperature", temperature)
     if bundle is not None:
         kwargs.setdefault("api_key", bundle.api_key)
         kwargs.setdefault("base_url", bundle.base_url)

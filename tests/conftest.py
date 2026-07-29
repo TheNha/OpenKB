@@ -6,11 +6,14 @@ import pytest
 @pytest.fixture(autouse=True)
 def _reset_extra_headers():
     """Keep the process-wide LLM extra-headers / extra-body / timeout /
-    parallel-tool-calls stashes from leaking across tests."""
+    ingest+query temperature / parallel-tool-calls stashes from leaking
+    across tests."""
     from openkb.config import (
         set_extra_body,
         set_extra_headers,
+        set_ingest_temperature,
         set_parallel_tool_calls,
+        set_query_temperature,
         set_timeout,
     )
 
@@ -18,6 +21,8 @@ def _reset_extra_headers():
     set_extra_headers({})
     set_extra_body({})
     set_timeout(None)
+    set_ingest_temperature(None)
+    set_query_temperature(None)
     set_parallel_tool_calls(None, False)
 
 

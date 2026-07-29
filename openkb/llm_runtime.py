@@ -12,7 +12,11 @@ other's key/headers/timeout.
 
 from __future__ import annotations
 
+import logging
+import math
 from typing import Any
+
+logger = logging.getLogger("openkb.config")
 
 _runtime_extra_headers: dict[str, str] = {}
 
@@ -65,6 +69,67 @@ def get_timeout_extra_args() -> dict[str, float] | None:
     return {"timeout": _runtime_timeout} if _runtime_timeout is not None else None
 
 
+# Process-wide LLM sampling temperature, split by phase — ingest (compiler.py
+# + PageIndex) and query/chat (query.py) are separate call sites a user may
+# want tuned differently (e.g. low temperature for consistent wiki writing,
+# higher for conversational answers). Set from config by the CLI, read at the
+# call sites via get_ingest_temperature()/get_query_temperature(). None = use
+# the provider's default.
+_runtime_ingest_temperature: float | None = None
+_runtime_query_temperature: float | None = None
+
+
+def set_ingest_temperature(temperature: float | None) -> None:
+    """Set the process-wide LLM sampling temperature for ingest (compile +
+    PageIndex) calls; ``None`` clears it."""
+    global _runtime_ingest_temperature
+    _runtime_ingest_temperature = temperature
+
+
+def get_ingest_temperature() -> float | None:
+    """Return the process-wide ingest-phase LLM sampling temperature, or ``None``."""
+    return _runtime_ingest_temperature
+
+
+def set_query_temperature(temperature: float | None) -> None:
+    """Set the process-wide LLM sampling temperature for query/chat calls;
+    ``None`` clears it."""
+    global _runtime_query_temperature
+    _runtime_query_temperature = temperature
+
+
+def resolve_temperature(config: dict, key: str = "temperature") -> float | None:
+    """Resolve an optional temperature key to a finite, non-negative float.
+
+    ``key`` lets ingest and query use distinct config keys
+    (``ingest_temperature`` / ``query_temperature``) sharing one validator.
+    Mirrors ``openkb.config.resolve_timeout``, except ``0`` is valid here (a
+    deterministic temperature), so only bools/non-numeric/nan/inf/negative
+    are rejected.
+    """
+    raw = config.get(key)
+    if raw is None:
+        return None
+    value = None if isinstance(raw, bool) else raw
+    try:
+        value = float(value) if isinstance(value, (int, float, str)) else None
+    except (TypeError, ValueError):
+        value = None
+    if value is None or not math.isfinite(value) or value < 0:
+        logger.warning(
+            "config: '%s' must be a finite non-negative number, got %r — ignoring it.",
+            key,
+            raw,
+        )
+        return None
+    return value
+
+
+def get_query_temperature() -> float | None:
+    """Return the process-wide query/chat-phase LLM sampling temperature, or ``None``."""
+    return _runtime_query_temperature
+
+
 # Process-wide agent ``parallel_tool_calls`` as ``(value, was_explicit)``, set
 # from config by the CLI and read when building agents. ``(None, False)`` = not
 # configured, so each agent falls back to its own default (resolve_model_settings).
@@ -101,4 +166,5 @@ def resolve_model_settings(*, default_parallel_tool_calls: bool | None = False) 
         "extra_body": get_extra_body() or None,
         "extra_args": get_timeout_extra_args(),
         "parallel_tool_calls": parallel_tool_calls,
+        "temperature": get_query_temperature(),
     }

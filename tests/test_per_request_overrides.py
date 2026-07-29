@@ -91,6 +91,55 @@ def test_bundle_reads_litellm_extra_headers(tmp_path):
     assert bundle.parallel_tool_calls_explicit is True
 
 
+def test_bundle_reads_ingest_and_query_temperature_independently(tmp_path):
+    """resolve_credential_bundle must surface both KB-level temperatures
+    separately, so a REST request threads each to its own call site (ingest
+    compile + PageIndex vs query/chat) just like the CLI path does via the
+    process-wide runtime globals."""
+    _write_config(tmp_path, {"ingest_temperature": 0.2, "query_temperature": 0.9})
+    bundle = resolve_credential_bundle(tmp_path)
+    assert bundle.ingest_temperature == 0.2
+    assert bundle.query_temperature == 0.9
+
+
+def test_bundle_temperature_falls_back_to_global(monkeypatch, tmp_path):
+    """A KB with no temperature of its own inherits global.yaml's — per phase —
+    so each can be set once for every KB in .config/global.yaml."""
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "global.yaml").write_text(
+        "ingest_temperature: 0.1\nquery_temperature: 0.7\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_DIR", global_dir)
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_PATH", global_dir / "global.yaml")
+
+    kb_dir = tmp_path / "kb"
+    _write_config(kb_dir, {})  # no temperature of its own
+
+    bundle = resolve_credential_bundle(kb_dir)
+    assert bundle.ingest_temperature == 0.1
+    assert bundle.query_temperature == 0.7
+
+
+def test_bundle_temperature_kb_overrides_global(monkeypatch, tmp_path):
+    """A KB-set temperature wins over global.yaml's, per phase independently."""
+    global_dir = tmp_path / "global"
+    global_dir.mkdir()
+    (global_dir / "global.yaml").write_text(
+        "ingest_temperature: 0.1\nquery_temperature: 0.7\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_DIR", global_dir)
+    monkeypatch.setattr("openkb.config.GLOBAL_CONFIG_PATH", global_dir / "global.yaml")
+
+    kb_dir = tmp_path / "kb"
+    # Only overrides ingest_temperature — query_temperature still inherits global.
+    _write_config(kb_dir, {"ingest_temperature": 0.8})
+
+    bundle = resolve_credential_bundle(kb_dir)
+    assert bundle.ingest_temperature == 0.8
+    assert bundle.query_temperature == 0.7
+
+
 def test_bundle_reads_extra_body(tmp_path):
     """resolve_credential_bundle must surface top-level extra_body, so a REST
     request threads e.g. Qwen3's enable_thinking toggle to LiteLLM just like

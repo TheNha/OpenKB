@@ -20,13 +20,18 @@ import yaml
 from openkb.llm_runtime import (  # noqa: F401 (re-export for backward compat)
     get_extra_body,
     get_extra_headers,
+    get_ingest_temperature,
     get_parallel_tool_calls,
+    get_query_temperature,
     get_timeout,
     get_timeout_extra_args,
     resolve_model_settings,
+    resolve_temperature,
     set_extra_body,
     set_extra_headers,
+    set_ingest_temperature,
     set_parallel_tool_calls,
+    set_query_temperature,
     set_timeout,
 )
 from openkb.locks import atomic_write_text, flock, funlock
@@ -307,6 +312,17 @@ def resolve_concurrency(config: dict) -> int | None:
     return value
 
 
+def resolve_effective_concurrency(config: dict) -> int | None:
+    """``resolve_concurrency`` plus a global.yaml fallback for KBs that don't
+    set their own — same rationale as extra_body/temperature: ``concurrency``
+    isn't in ``GLOBAL_SCALAR_KEYS``, so ``resolve_effective_config`` doesn't
+    layer it in from global.yaml on its own. ``or`` is safe here (unlike
+    temperature): ``resolve_concurrency`` never returns 0, only a positive
+    int or ``None``.
+    """
+    return resolve_concurrency(config) or resolve_concurrency(load_global_config())
+
+
 def resolve_litellm_settings(config: dict) -> dict[str, Any]:
     """Resolve the optional ``litellm:`` mapping of LiteLLM module settings.
 
@@ -349,7 +365,8 @@ def resolve_per_request_overrides(
     ``litellm.extra_headers`` / ``litellm.timeout`` / ``litellm.extra_body``
     override their top-level counterparts (legacy precedence) and are popped
     from ``litellm_settings`` so they aren't also applied as process-wide
-    litellm module settings.
+    litellm module settings. ``ingest_temperature`` / ``query_temperature``
+    are resolved separately by callers, like ``parallel_tool_calls``.
     """
     extra_headers = resolve_extra_headers(config)
     timeout = resolve_timeout(config)
@@ -382,6 +399,8 @@ class LlmCredentialBundle:
     extra_headers: dict[str, str] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
     timeout: float | None = None
+    ingest_temperature: float | None = None
+    query_temperature: float | None = None
     parallel_tool_calls: bool | None = None
     parallel_tool_calls_explicit: bool = False
 
@@ -440,6 +459,15 @@ def resolve_credential_bundle(kb_dir: Path) -> LlmCredentialBundle:
         # extra_body (e.g. Qwen3's enable_thinking toggle) apply to every KB
         # that doesn't override it.
         extra_body = resolve_extra_body(load_global_config())
+
+    def _resolve_temp(key: str) -> float | None:
+        # Same KB-wins-over-global fallback as extra_body above. Explicit
+        # `is None` (not `or`) since 0 is a valid, falsy temperature.
+        value = resolve_temperature(config, key)
+        return value if value is not None else resolve_temperature(load_global_config(), key)
+
+    ingest_temperature = _resolve_temp("ingest_temperature")
+    query_temperature = _resolve_temp("query_temperature")
     parallel_tool_calls, parallel_tool_calls_explicit = resolve_parallel_tool_calls(config)
 
     return LlmCredentialBundle(
@@ -448,6 +476,8 @@ def resolve_credential_bundle(kb_dir: Path) -> LlmCredentialBundle:
         extra_headers=extra_headers,
         extra_body=extra_body,
         timeout=timeout,
+        ingest_temperature=ingest_temperature,
+        query_temperature=query_temperature,
         parallel_tool_calls=parallel_tool_calls,
         parallel_tool_calls_explicit=parallel_tool_calls_explicit,
     )

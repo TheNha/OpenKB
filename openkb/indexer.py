@@ -15,8 +15,9 @@ from openkb.config import (
     LlmCredentialBundle,
     get_extra_body,
     get_extra_headers,
+    get_ingest_temperature,
     get_timeout,
-    resolve_concurrency,
+    resolve_effective_concurrency,
     resolve_effective_config,
 )
 from openkb.tree_renderer import render_summary_md
@@ -173,16 +174,18 @@ def _build_index_config(
     forbids unknown kwargs).
 
     Also forwards the LLM credential/tuning overrides (``api_key``, ``base_url``,
-    ``extra_headers``, ``extra_body``, ``timeout``) via PageIndex's
-    ``llm_params`` extension point, so PageIndex's own internal LLM calls (TOC
-    extraction, summarization) see the same OpenAI-compatible endpoint and
-    request tweaks (e.g. ``extra_body: {chat_template_kwargs: {enable_thinking:
-    false}}`` for Qwen3) as the rest of OpenKB's compile pipeline. When *bundle*
-    is ``None`` (CLI path), ``api_key``/``base_url`` are left unset here because
+    ``extra_headers``, ``extra_body``, ``timeout``, ``ingest_temperature``) via
+    PageIndex's ``llm_params`` extension point, so PageIndex's own internal LLM
+    calls (TOC extraction, summarization) see the same OpenAI-compatible
+    endpoint and request tweaks (e.g. ``extra_body: {chat_template_kwargs:
+    {enable_thinking: false}}`` for Qwen3) as the rest of OpenKB's compile
+    pipeline — ``ingest_temperature`` (not ``query_temperature``) applies here
+    since PageIndex is part of the ingest phase. When *bundle* is ``None`` (CLI
+    path), ``api_key``/``base_url`` are left unset here because
     ``cli._setup_llm_key`` already exported them as process env vars that
-    PageIndex's litellm calls pick up on their own; ``extra_headers``/
-    ``extra_body``/``timeout`` still come from the process-wide runtime globals
-    so CLI-driven indexing respects the same config as REST.
+    PageIndex's litellm calls pick up on their own; the rest still come from
+    the process-wide runtime globals so CLI-driven indexing respects the same
+    config as REST.
     """
     kwargs: dict[str, Any] = {
         "if_add_node_text": True,
@@ -202,7 +205,7 @@ def _build_index_config(
                 "version does not support it yet — ignoring it."
             )
 
-    concurrency = resolve_concurrency(config)
+    concurrency = resolve_effective_concurrency(config)
     if concurrency is not None:
         if "max_concurrency" in IndexConfig.model_fields:
             kwargs["max_concurrency"] = concurrency
@@ -222,6 +225,9 @@ def _build_index_config(
     timeout = bundle.timeout if bundle is not None else get_timeout()
     if timeout is not None:
         llm_params["timeout"] = timeout
+    temperature = bundle.ingest_temperature if bundle is not None else get_ingest_temperature()
+    if temperature is not None:
+        llm_params["temperature"] = temperature
     if bundle is not None:
         if bundle.api_key is not None:
             llm_params["api_key"] = bundle.api_key
@@ -232,9 +238,9 @@ def _build_index_config(
             kwargs["llm_params"] = llm_params
         else:
             logger.warning(
-                "config: extra_headers/extra_body/timeout/credential overrides are "
-                "set but the installed PageIndex version does not support "
-                "'llm_params' yet — ignoring them."
+                "config: extra_headers/extra_body/timeout/temperature/credential "
+                "overrides are set but the installed PageIndex version does not "
+                "support 'llm_params' yet — ignoring them."
             )
     return IndexConfig(**kwargs)
 
