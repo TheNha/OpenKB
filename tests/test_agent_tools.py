@@ -130,6 +130,26 @@ class TestReadWikiFile:
 
         assert result == "File not found: sources/missing.md"
 
+    def test_extensionless_wikilink_target_falls_back_to_md(self, tmp_path):
+        """A [[wikilink]] target has no extension (e.g. "summaries/doc") —
+        passing it to read_file verbatim (as the model naturally does, since
+        that's the literal text inside [[...]]) must still resolve, not
+        require the model to correctly guess/append ".md" itself."""
+        wiki_root = str(tmp_path)
+        (tmp_path / "summaries").mkdir()
+        (tmp_path / "summaries" / "HDSD-Quản-lý-văn-bản-1.md").write_text("Content.")
+
+        result = read_wiki_file("summaries/HDSD-Quản-lý-văn-bản-1", wiki_root)
+
+        assert result == "Content."
+
+    def test_extensionless_fallback_still_reports_not_found_when_absent(self, tmp_path):
+        wiki_root = str(tmp_path)
+
+        result = read_wiki_file("summaries/missing", wiki_root)
+
+        assert result == "File not found: summaries/missing"
+
     def test_path_is_relative_to_wiki_root(self, tmp_path):
         wiki_root = str(tmp_path)
         (tmp_path / "summaries").mkdir()
@@ -251,7 +271,10 @@ class TestGetWikiPageContent:
         result = get_wiki_page_content("paper", "99", wiki_root)
         assert "no content" in result.lower()
 
-    def test_includes_images_info(self, tmp_path):
+    def test_image_markdown_in_content_passes_through_unchanged(self, tmp_path):
+        """images.py:convert_pdf_to_pages always embeds an image's path as an
+        inline ![image](path) reference in `content` at its extracted
+        position — that must survive verbatim for the agent to echo it."""
         import json
 
         wiki_root = str(tmp_path)
@@ -260,13 +283,34 @@ class TestGetWikiPageContent:
         pages = [
             {
                 "page": 1,
-                "content": "Text.",
-                "images": [{"path": "images/p/img.png", "width": 100, "height": 80}],
+                "content": "Text.\n\n![image](sources/images/p/img.png)\n\nMore text.",
+                "images": [{"path": "sources/images/p/img.png", "width": 100, "height": 80}],
             }
         ]
         (sources / "doc.json").write_text(json.dumps(pages), encoding="utf-8")
         result = get_wiki_page_content("doc", "1", wiki_root)
-        assert "img.png" in result
+        assert "![image](sources/images/p/img.png)" in result
+
+    def test_does_not_append_redundant_images_hint(self, tmp_path):
+        """A trailing "[Images: ...]" line would just repeat a path already
+        embedded inline as ![image](path) in `content` — reliably getting
+        the model to notice and echo it is the prompt's job (see the
+        image-tracking guidance in agent/query.py), not this tool's."""
+        import json
+
+        wiki_root = str(tmp_path)
+        sources = tmp_path / "sources"
+        sources.mkdir()
+        pages = [
+            {
+                "page": 1,
+                "content": "Text.\n\n![image](sources/images/p/img.png)",
+                "images": [{"path": "sources/images/p/img.png"}],
+            }
+        ]
+        (sources / "doc.json").write_text(json.dumps(pages), encoding="utf-8")
+        result = get_wiki_page_content("doc", "1", wiki_root)
+        assert "[Images:" not in result
 
     def test_path_escape_denied(self, tmp_path):
         wiki_root = str(tmp_path)

@@ -24,35 +24,91 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
 
 {schema_md}
 
+## When to search vs. answer directly
+- Greetings and meta questions about yourself ("hi", "who are you", "what can
+  you do") have no wiki content to look up — answer them directly, no tools.
+- Every other question — informational, "how do I...", "what is...",
+  troubleshooting, anything that could plausibly be documented — you MUST
+  call read_file("index.md") first, before writing any answer. This
+  includes topics you think you already know from general/world knowledge:
+  the wiki holds this organization's own specific procedures, which can
+  differ from — or simply not match — what you'd otherwise assume. Answering
+  such a question without having read index.md first, or claiming you
+  "searched and found nothing" when you never called a tool, is a critical
+  failure, not an acceptable fallback.
+
+## Hard rule: a summary alone is never enough to answer
+Every summaries/*.md page is LLM-generated and lossy — it can omit details
+and, in particular, it ALMOST ALWAYS drops the image references that exist
+in the original source page content. Reading a summary that turns out to be
+relevant to the question is a signal to go fetch the source, not a stopping
+point. The moment a summary shows content relevant to the question, you MUST
+fetch its underlying source before writing any answer — per its `full_text`
+frontmatter field:
+- doc_type: short     → read_file(<the full_text path>).
+- doc_type: pageindex → get_page_content(doc_name, pages) using the page
+  range(s) shown by the summary's tree structure. Call it for every range
+  that looks relevant, not just the first — never fetch the whole document.
+  Prefer several tight, targeted calls (e.g. one per relevant subsection)
+  over one broad range: dumping 20+ pages into context at once makes it
+  much easier to lose track of specific details — including image
+  references — by the time you write the answer.
+Answering from a summary's prose alone, without this follow-up call, is the
+single most common failure mode here. Do not do it.
+
 ## Search strategy
 1. Read index.md to see all documents and concepts with brief summaries.
    Each document is marked (short) or (pageindex) to indicate its type.
-2. Read relevant summary pages (summaries/) for document overviews.
-   Summaries may omit details — if you need more, follow the summary's
-   `full_text` frontmatter field to the source (see step 4).
+   Match on the question's full, specific meaning — not on any one shared
+   word. Different documents can each contain a word from the question while
+   covering entirely different, non-overlapping topics; a narrower/more
+   specific phrase names a more specific thing than its individual words do
+   alone, and the document whose brief matches that specific phrase is the
+   right one, even if a different document merely shares a common word with
+   the question. When more than one document's brief looks plausible, don't
+   commit to the first one that shares a word — read each plausible
+   candidate's summary and judge which one actually covers what's being
+   asked.
+2. Read relevant summary pages (summaries/) for document overviews, then
+   apply the Hard rule above before using their content.
 3. Read concept pages (concepts/) for cross-document synthesis.
 4. For "who/what is X" questions about a specific named person, organization,
    place, or product, read the matching page in entities/ first.
-5. When you need detailed source document content, each summary page has a
-   `full_text` frontmatter field with the path to the original document content:
-   - Short documents (doc_type: short): read_file with that path.
-   - PageIndex documents (doc_type: pageindex): use get_page_content(doc_name, pages)
-     with tight page ranges. The summary shows document tree structure with page
-     ranges to help you target. Never fetch the whole document.
-6. Source content may reference images. Short-doc .md pages link them
-   note-relative (e.g. ![image](images/doc/file.png), resolved from
-   wiki/sources/); long-doc JSON page metadata lists them wiki-root-relative
-   (e.g. sources/images/doc/file.png). Pass either form as seen to the
-   get_image tool — it accepts both.
-7. Synthesize a clear, concise, well-cited answer grounded in wiki content.
-   If a figure, chart, or diagram you looked at (via get_image) or saw
-   referenced in the source content is directly relevant to the answer,
-   include its Markdown image reference (e.g. ![image](images/doc/file.png)
-   or ![image](sources/images/doc/file.png)) inline, exactly as it appeared
-   in the source, so the user can see it — don't just describe it in prose.
+5. Source content embeds image references inline, right next to the text
+   they illustrate — e.g. ![image](images/doc/file.png) (short docs) or
+   ![image](sources/images/doc/file.png) (pageindex docs). Rule: whenever
+   you write about something the source described using one of these images,
+   keep that exact reference in your answer, at the same spot. Never
+   describe an image in words instead of including its reference, and never
+   alter the path. If a page you read has no image, your answer covers that
+   part with no image — that's correct, not a gap to fill.
 
-Answer based only on wiki content. Be concise.
+   Example — source has "Step 2: Position the signature note at the top
+   edge.\n![image](sources/images/doc/p9_img2.png)". Your answer must keep
+   that reference: "**Step 2:** Position the signature note at the top
+   edge.\n![image](sources/images/doc/p9_img2.png)".
+6. Synthesize a clear, concise, well-cited answer grounded in wiki content.
+   Match its length and depth to how specific the question is, not to how
+   much source content you happened to find:
+   - A broad/conceptual question ("what is X", "what is X for", "give an
+     overview of X") gets a short, high-level answer — a few sentences, at
+     most a handful of the most important highlights. A source page that
+     lists many subsections/features is not an instruction to enumerate all
+     of them; pick what actually answers the question and leave the rest.
+   - A specific/procedural question ("how do I do X", "what are the exact
+     steps for Y") gets the full depth it needs — every step, every
+     relevant image — do not compress away detail the question asked for.
+   When unsure which kind a question is, err toward the shorter answer: it's
+   easier for the user to ask a follow-up than to find their actual question
+   buried in an over-long one.
+
+Answer based only on wiki content.
 Before each tool call, output one short sentence explaining the reason.
+
+Before finalizing: if you read any summaries/*.md page relevant to this
+question, confirm you already called get_page_content (pageindex) or
+read_file on its source per the Hard rule above. If not, call it now — do
+not finalize an answer built only from summary text.
 
 If you cannot find relevant information, say so clearly.
 """
@@ -124,7 +180,7 @@ def build_query_agent(
     return Agent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, get_image],
+        tools=[read_file, get_page_content],
         model=f"litellm/{model}",
         model_settings=ModelSettings(**model_settings),
     )
@@ -235,9 +291,10 @@ def build_chat_agent(
     ``SKILL.md`` files. Any found skill is exposed to the agent via
     ``ShellTool.environment.skills`` so the model can ``cat`` the skill body
     and follow its instructions when the user's request matches. Set
-    ``enable_skills: false`` in config.yaml/global.yaml to skip this
-    entirely (KB config wins over global; unset means enabled — unchanged
-    behavior for existing KBs).
+    ``enable_skills: false`` in config.yaml/global.yaml to skip skill
+    discovery *and* the ``write_file`` tool entirely — both only make sense
+    together, for KBs used purely for wiki Q&A (KB config wins over global;
+    unset means enabled — unchanged behavior for existing KBs).
     """
     wiki_root = str(kb_dir / "wiki")
     kb_root = str(kb_dir)
@@ -260,7 +317,7 @@ def build_chat_agent(
         """
         return write_kb_file(path, content, kb_root)
 
-    extra_tools: list = [write_file]
+    extra_tools: list = []
     skill_instructions_addendum = ""
 
     # Skill discovery via function tools. The agents SDK has a richer
@@ -324,7 +381,7 @@ def build_chat_agent(
             _, body = _parse_frontmatter(text)
             return body
 
-        extra_tools.extend([list_skills, read_skill])
+        extra_tools.extend([list_skills, read_skill, write_file])
 
         # Build the prompt addendum listing skill names + descriptions
         # right inside the system prompt so the model sees them up front

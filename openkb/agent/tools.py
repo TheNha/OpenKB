@@ -43,6 +43,10 @@ def read_wiki_file(path: str, wiki_root: str) -> str:
 
     Args:
         path: File path relative to *wiki_root* (e.g. ``"sources/notes.md"``).
+            A ``[[wikilink]]`` target has no extension (e.g.
+            ``summaries/doc``) — if the exact path doesn't exist and it has
+            no ``.md`` suffix, a ``.md``-suffixed retry is tried before
+            reporting not-found, so passing a wikilink target verbatim works.
         wiki_root: Absolute path to the wiki root directory.
 
     Returns:
@@ -52,6 +56,10 @@ def read_wiki_file(path: str, wiki_root: str) -> str:
     full_path = (root / path).resolve()
     if not full_path.is_relative_to(root):
         return "Access denied: path escapes wiki root."
+    if not full_path.exists() and not path.endswith(".md"):
+        full_path = (root / f"{path}.md").resolve()
+        if not full_path.is_relative_to(root):
+            return "Access denied: path escapes wiki root."
     if not full_path.exists():
         return f"File not found: {path}"
     return full_path.read_text(encoding="utf-8")
@@ -124,12 +132,14 @@ def get_wiki_page_content(doc_name: str, pages: str, wiki_root: str) -> str:
     for entry in matches:
         page_num = entry["page"]
         content = entry.get("content", "")
+        # Not appending an "images" hint here: every path in the `images`
+        # list is already embedded in `content` as an inline ![image](path)
+        # markdown reference (see images.py:convert_pdf_to_pages), correctly
+        # positioned at its extracted spot in the page's reading order. The
+        # agent's instructions are responsible for making sure that inline
+        # reference actually gets noticed and echoed — see the Hard rule /
+        # image-tracking guidance in agent/query.py.
         block = f"[Page {page_num}]\n{content}"
-        images = entry.get("images")
-        if images:
-            paths = ", ".join(img["path"] for img in images if "path" in img)
-            if paths:
-                block += f"\n[Images: {paths}]"
         parts.append(block)
 
     return "\n\n".join(parts) + "\n\n"

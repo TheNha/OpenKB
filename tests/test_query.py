@@ -17,16 +17,14 @@ class TestBuildQueryAgent:
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
         assert agent.name == "wiki-query"
 
-    def test_agent_has_three_tools(self, tmp_path):
+    def test_agent_has_two_tools(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
-        assert len(agent.tools) == 3
+        assert len(agent.tools) == 2
 
     def test_agent_tool_names(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
         names = {t.name for t in agent.tools}
-        assert "read_file" in names
-        assert "get_page_content" in names
-        assert "get_image" in names
+        assert names == {"read_file", "get_page_content"}
 
     def test_instructions_mention_get_page_content(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
@@ -83,15 +81,16 @@ def test_query_strategy_mentions_entities():
 
 
 def test_query_strategy_tells_agent_to_echo_relevant_images():
-    """Retrieved page content includes image markdown, but the agent used to
-    only be told to *view* figures (get_image), never to include their
-    Markdown reference back in the answer — so relevant images never reached
-    the user in chat. Instructions must tell it to echo the reference."""
+    """Source content may include Markdown image references, but there is no
+    get_image (vision) tool wired into this agent — the only way an image
+    reaches the user is by copying its ![image](...) reference verbatim into
+    the answer text. Instructions must say so, without depending on a tool
+    that isn't in the agent's tool list."""
     from openkb.agent import query as query_mod
 
     text = query_mod._QUERY_INSTRUCTIONS_TEMPLATE
     assert "![image]" in text
-    assert "include" in text.lower() and "image" in text.lower()
+    assert "get_image" not in text
 
 
 class TestResolveToolCallId:
@@ -363,6 +362,7 @@ class TestBuildChatAgentEnableSkills:
         names = {t.name for t in agent.tools}
         assert "list_skills" in names
         assert "read_skill" in names
+        assert "write_file" in names
 
     def test_kb_disables_skills(self, tmp_path):
         self._write_skill(tmp_path)
@@ -371,8 +371,8 @@ class TestBuildChatAgentEnableSkills:
         names = {t.name for t in agent.tools}
         assert "list_skills" not in names
         assert "read_skill" not in names
-        # write_file must still be there — enable_skills only gates discovery.
-        assert "write_file" in names
+        # write_file is bundled with skill discovery — no skills, no writing.
+        assert "write_file" not in names
 
     def test_kb_disables_skills_removes_prompt_addendum(self, tmp_path):
         self._write_skill(tmp_path)

@@ -341,3 +341,52 @@ class TestRepeatedImageFiltering:
 
         all_images = [img["path"] for p in pages for img in p["images"]]
         assert len(all_images) == 2, all_images
+
+
+# ---------------------------------------------------------------------------
+# Reading order (image interleaved with text, not dumped at page end)
+# ---------------------------------------------------------------------------
+
+
+def _make_pdf_with_image_between_text(path):
+    """A page where the image is drawn LAST in the content stream (as many PDF
+    exporters do — a text pass, then an image/annotation pass) but sits
+    visually BETWEEN two text blocks. Without ``sort=True`` on
+    ``get_text("dict")``, PyMuPDF returns blocks in content-stream order,
+    stranding the image after both text blocks regardless of where it
+    visually belongs."""
+    img = _make_pixmap(80, 80, (200, 0, 0))
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=400)
+    page.insert_text((20, 30), "Step 1: do something first.")
+    page.insert_text((20, 250), "Step 3: do something after the image.")
+    page.insert_image(pymupdf.Rect(20, 100, 100, 180), pixmap=img)  # inserted last
+    doc.save(str(path))
+    doc.close()
+
+
+class TestReadingOrder:
+    def test_convert_pdf_with_images_places_image_between_text(self, tmp_path):
+        pdf_path = tmp_path / "doc.pdf"
+        _make_pdf_with_image_between_text(pdf_path)
+        images_dir = tmp_path / "images"
+
+        markdown = convert_pdf_with_images(pdf_path, "doc", images_dir)
+
+        step1 = markdown.index("Step 1")
+        image = markdown.index("![image](")
+        step3 = markdown.index("Step 3")
+        assert step1 < image < step3, markdown
+
+    def test_convert_pdf_to_pages_places_image_between_text(self, tmp_path):
+        pdf_path = tmp_path / "doc.pdf"
+        _make_pdf_with_image_between_text(pdf_path)
+        images_dir = tmp_path / "images"
+
+        pages = convert_pdf_to_pages(pdf_path, "doc", images_dir)
+        content = pages[0]["content"]
+
+        step1 = content.index("Step 1")
+        image = content.index("![image](")
+        step3 = content.index("Step 3")
+        assert step1 < image < step3, content

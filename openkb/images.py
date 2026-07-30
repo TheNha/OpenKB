@@ -1,4 +1,13 @@
-"""Image extraction and copy utilities for the OpenKB converter pipeline."""
+"""Image extraction and copy utilities for the OpenKB converter pipeline.
+
+Every ``page.get_text("dict", ...)`` call below passes ``sort=True``: PyMuPDF's
+default block order follows the PDF's content stream (drawing order), not
+visual position — many PDF exporters draw all images in a separate pass after
+all text, so an image would otherwise land at the end of the page regardless
+of where it visually belongs, detaching it from the paragraph it illustrates.
+``sort=True`` reorders blocks top-to-bottom (then left-to-right) by bounding
+box, matching reading order.
+"""
 
 from __future__ import annotations
 
@@ -40,7 +49,7 @@ def _repeated_image_hashes(doc: pymupdf.Document, min_dim: int = _MIN_IMAGE_DIM)
     pages_seen: dict[str, set[int]] = {}
     for page_idx in range(len(doc)):
         page = doc[page_idx]
-        for block in page.get_text("dict")["blocks"]:
+        for block in page.get_text("dict", sort=True)["blocks"]:
             if block["type"] != 1:  # not an image block
                 continue
             if block.get("width", 0) < min_dim or block.get("height", 0) < min_dim:
@@ -92,7 +101,7 @@ def extract_pdf_images(pdf_path: Path, doc_name: str, images_dir: Path) -> dict[
             page = doc[page_idx]
             page_num = page_idx + 1
 
-            for block in page.get_text("dict")["blocks"]:
+            for block in page.get_text("dict", sort=True)["blocks"]:
                 if block["type"] != 1:  # not an image block
                     continue
 
@@ -150,7 +159,7 @@ def convert_pdf_to_pages(pdf_path: Path, doc_name: str, images_dir: Path) -> lis
             parts: list[str] = []
             page_images: list[dict] = []
 
-            for block in page.get_text("dict")["blocks"]:
+            for block in page.get_text("dict", sort=True)["blocks"]:
                 if block["type"] == 0:  # text block
                     lines = []
                     for line in block["lines"]:
@@ -217,7 +226,7 @@ def convert_pdf_with_images(pdf_path: Path, doc_name: str, images_dir: Path) -> 
             page_num = page_idx + 1
             parts.append("\n\n")
 
-            for block in page.get_text("dict")["blocks"]:
+            for block in page.get_text("dict", sort=True)["blocks"]:
                 if block["type"] == 0:  # text block
                     lines = []
                     for line in block["lines"]:
