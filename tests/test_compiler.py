@@ -1770,6 +1770,117 @@ class TestCompileConceptsPlan:
         assert "[[concepts/flash-attention]]" in index_text
         assert "[[concepts/attention]]" in index_text
 
+    def _two_step_dispatch(self, seen, facts, merged_content):
+        """litellm.acompletion stub that answers the extraction and the merge
+        call differently, and records whether the source document was visible
+        to the merge call."""
+
+        async def dispatch(*args, **kwargs):
+            text = json.dumps(kwargs.get("messages", []), default=str)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.usage = MagicMock(prompt_tokens=1, completion_tokens=1)
+            resp.usage.prompt_tokens_details = None
+            if "list the facts" in text:
+                seen["facts"] += 1
+                resp.choices[0].message.content = json.dumps({"facts": facts})
+            else:
+                seen["merge"] += 1
+                seen["doc_visible_to_merge"] = "DOC-BODY-MARKER" in text
+                resp.choices[0].message.content = json.dumps(
+                    {"description": "d", "content": merged_content}
+                )
+            return resp
+
+        return dispatch
+
+    @pytest.mark.asyncio
+    async def test_update_extracts_facts_then_merges_without_the_document(self, tmp_path):
+        """The merge call must NOT see the source document.
+
+        A single-call update let the new document (large, in the cached
+        prefix) dominate the model's context and crowd out what earlier
+        documents had contributed. Splitting extraction from merging is what
+        removes that pressure, so the merge call's context is asserted here.
+        """
+        wiki = self._setup_wiki(
+            tmp_path,
+            existing_concepts={
+                "attention": '---\nsources: ["summaries/old.md"]\n---\n\n'
+                "# Attention\n\n## Prior aspect\n\nSee https://old.example/spec.\n",
+            },
+        )
+        plan = json.dumps(
+            {"create": [], "update": [{"name": "attention", "title": "Attention"}], "related": []}
+        )
+        seen = {"facts": 0, "merge": 0, "doc_visible_to_merge": None}
+        merged = (
+            "# Attention\n\n## Prior aspect\n\nSee https://old.example/spec.\n\n"
+            "## Flash variant\n\nHalves memory use.\n"
+        )
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=_mock_completion([plan]))
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=self._two_step_dispatch(seen, ["Flash variant halves memory."], merged)
+            )
+            await _compile_concepts(
+                wiki,
+                tmp_path,
+                "gpt-4o-mini",
+                {"role": "system", "content": "You are a wiki agent."},
+                {"role": "user", "content": "DOC-BODY-MARKER full document text."},
+                "Summary.",
+                "test-doc",
+                5,
+            )
+
+        assert seen["facts"] == 1 and seen["merge"] == 1
+        assert seen["doc_visible_to_merge"] is False
+
+        text = (wiki / "concepts" / "attention.md").read_text(encoding="utf-8")
+        assert "https://old.example/spec" in text  # earlier document's fact survives
+        assert "Flash variant" in text  # new document's fact landed
+        assert "summaries/test-doc.md" in text and "summaries/old.md" in text
+
+    @pytest.mark.asyncio
+    async def test_update_with_no_new_facts_leaves_body_untouched(self, tmp_path):
+        """When the document adds nothing, skip the merge entirely: a rewrite
+        could only subtract. `sources:` still gains the document, because the
+        relationship is real even when the content isn't new."""
+        body = "# Attention\n\n## Prior aspect\n\nSee https://old.example/spec.\n"
+        wiki = self._setup_wiki(
+            tmp_path,
+            existing_concepts={"attention": f'---\nsources: ["summaries/old.md"]\n---\n\n{body}'},
+        )
+        plan = json.dumps(
+            {"create": [], "update": [{"name": "attention", "title": "Attention"}], "related": []}
+        )
+        seen = {"facts": 0, "merge": 0, "doc_visible_to_merge": None}
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=_mock_completion([plan]))
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=self._two_step_dispatch(seen, [], "SHOULD NOT BE WRITTEN")
+            )
+            await _compile_concepts(
+                wiki,
+                tmp_path,
+                "gpt-4o-mini",
+                {"role": "system", "content": "You are a wiki agent."},
+                {"role": "user", "content": "DOC-BODY-MARKER full document text."},
+                "Summary.",
+                "test-doc",
+                5,
+            )
+
+        assert seen["facts"] == 1
+        assert seen["merge"] == 0  # no rewrite was even attempted
+        text = (wiki / "concepts" / "attention.md").read_text(encoding="utf-8")
+        assert "SHOULD NOT BE WRITTEN" not in text
+        assert "https://old.example/spec" in text
+        assert "summaries/test-doc.md" in text  # relationship still recorded
+
     def test_parse_page_json_unwraps_and_guards_shape(self):
         """#158: _parse_page_json returns an object, unwraps a single-element
         ``[{...}]`` array, and returns None for wrong-shaped-but-valid JSON."""
@@ -2646,6 +2757,43 @@ def test_plan_prompt_keeps_topic_itself_guard():
     from openkb.agent.compiler import _CONCEPTS_PLAN_USER
 
     assert "just the document topic itself" in _CONCEPTS_PLAN_USER
+
+
+def test_plan_prompt_distinguishes_update_from_related():
+    """Regression: a document that adds a distinct fact/procedure about an
+    existing entity (not its main topic) used to get classified "related"
+    (link-only, no content rewrite) — so that new information silently never
+    reached the page. The prompt must tell the model this case is "update"."""
+    from openkb.agent.compiler import _CONCEPTS_PLAN_USER
+
+    assert '"update", not "related"' in _CONCEPTS_PLAN_USER
+
+
+def test_merge_prompts_warn_against_dropping_other_documents_content():
+    """Regression: an entity/concept updated by many documents over time had
+    a later, unrelated-topic document's rewrite silently drop an earlier
+    section (observed: a "card lifecycle" doc erased a "user access/unlock"
+    section an earlier doc had contributed). The merge prompts — the ones
+    actually sent on the update path — must state that everything already on
+    the page stays."""
+    from openkb.agent.compiler import _CONCEPT_MERGE_USER, _ENTITY_MERGE_USER
+
+    for prompt in (_CONCEPT_MERGE_USER, _ENTITY_MERGE_USER):
+        assert "Everything already on the page stays" in prompt
+        assert "OTHER documents" in prompt
+        # Framed as editing an existing page, not authoring a fresh one from
+        # the facts — the framing that let the old single-call flow replace.
+        assert "editing a page, not writing a" in prompt
+
+
+def test_fact_extraction_prompt_allows_an_empty_result():
+    """The extraction step must be free to report "this document adds
+    nothing" — that's what lets the merge (and its rewrite risk) be skipped
+    entirely rather than padded with invented facts."""
+    from openkb.agent.compiler import _PAGE_FACTS_USER
+
+    assert "empty list" in _PAGE_FACTS_USER
+    assert "do not invent or pad" in _PAGE_FACTS_USER
 
 
 class TestLLMCallExtraHeaders:

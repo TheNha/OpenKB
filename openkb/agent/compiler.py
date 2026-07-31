@@ -126,6 +126,13 @@ Rules:
 - Do NOT create a concept/entity that overlaps an existing one — use "update".
 - Do NOT create concepts that are just the document topic itself.
 - "related" is lightweight cross-linking only, no content rewrite.
+- "update" vs "related" for an existing concept/entity: if this document
+  describes a distinct fact, process, or procedure about it that its current
+  page does NOT already cover — even if the entity/concept isn't this
+  document's main topic — that is "update", not "related", because skipping
+  the content rewrite means that information never reaches the page at all.
+  Reserve "related" for when the document only mentions the concept/entity in
+  passing, with nothing new to add to what the page already says.
 
 Return ONLY valid JSON, no fences, no explanation.
 """
@@ -160,29 +167,6 @@ whitelist message above.
 Return ONLY valid JSON, no fences.
 """
 
-_CONCEPT_UPDATE_USER = """\
-Update the concept page for: {title}
-
-Current content of this page:
-{existing_content}
-
-New information from document "{doc_name}" (summarized above) should be \
-integrated into this page. Rewrite the full page incorporating the new \
-information naturally — do not just append. Preserve the existing structure \
-and intent of the page.
-
-For [[wikilinks]] in the rewrite, follow the whitelist rules from the \
-message above: keep links whose target is in the whitelist, convert any \
-existing links whose target is NOT in the whitelist to plain text, and do \
-not invent new wikilink targets.
-
-Return a JSON object with two keys:
-- "description": A single sentence (under 100 chars) defining this concept (may differ from before)
-- "content": The rewritten full concept page in Markdown
-
-Return ONLY valid JSON, no fences.
-"""
-
 _ENTITY_PAGE_USER = """\
 Write the entity page for: {title} (type: {type})
 
@@ -199,21 +183,97 @@ Return a JSON object with three keys:
 Return ONLY valid JSON, no fences.
 """
 
-_ENTITY_UPDATE_USER = """\
-Update the entity page for: {title} (type: {type})
+# --- Two-step update: extract new facts, then merge them into the page ------
+#
+# A single-call update asks the model to regenerate a whole page while the new
+# document dominates its context (the document sits in the cached prefix and
+# routinely outweighs the page several times over). The result reliably reads
+# as "a page about the document I just read", silently dropping what earlier
+# documents had contributed. Splitting the work removes that pressure:
+# extraction sees the document but only emits a fact list (a page cannot be
+# lost by a call that doesn't write one), and the merge sees the page and the
+# facts but NOT the document, so nothing competes with the page for attention.
 
-Current content of this page:
+_PAGE_FACTS_USER = """\
+The wiki already has a {kind} page for: {title}
+
+Its current content is:
+---
 {existing_content}
+---
 
-Integrate the new facts about this entity from document "{doc_name}"
-(summarized above). Rewrite the full page — do not just append. Preserve the
-existing structure and intent. Follow the whitelist rules from the message
-above for all [[wikilinks]].
+Considering ONLY the document "{doc_name}" summarized above, list the facts
+about {title} that this document establishes and the page above does NOT
+already state.
+
+Rules:
+- Judge against the page above: if it already says something, that is not new.
+- Only facts genuinely about {title} — not everything the document covers.
+- Each fact must be self-contained and specific enough to stand on its own in
+  the page (keep exact values, URLs, addresses, paths, step sequences).
+- It is entirely normal for a document to add nothing about {title}. Return an
+  empty list in that case — do not invent or pad.
+
+Return a JSON object with one key:
+- "facts": array of strings (may be empty)
+
+Return ONLY valid JSON, no fences.
+"""
+
+_CONCEPT_MERGE_USER = """\
+Here is the current wiki concept page for: {title}
+
+---
+{existing_content}
+---
+
+Integrate the following new facts, drawn from document "{doc_name}", into
+that page:
+{facts_block}
+
+Return the page with those facts worked in — placed where they belong so the
+page still reads as one coherent explanation, not appended as a loose block.
+Everything already on the page stays: it was built from OTHER documents too,
+and anything you drop is lost for good. You are editing a page, not writing a
+new one from the facts above.
+
+Use [[wikilinks]] only for targets in the whitelist from the message above,
+and add a link to [[summaries/{doc_name}]] where it fits naturally.
+
+Return a JSON object with two keys:
+- "description": A single sentence (under 100 chars) defining this concept
+- "content": The full updated concept page in Markdown
+
+Return ONLY valid JSON, no fences.
+"""
+
+_ENTITY_MERGE_USER = """\
+Here is the current wiki entity page for: {title} (type: {type})
+
+---
+{existing_content}
+---
+
+Integrate the following new facts, drawn from document "{doc_name}", into
+that page:
+{facts_block}
+
+Return the page with those facts worked in — placed where they belong so the
+page still reads as one coherent description, not appended as a loose block.
+An entity legitimately has several unrelated aspects (how it works
+technically, how users get access to it, what breaks and how it is fixed);
+new facts about one aspect must not displace the sections covering another.
+Everything already on the page stays: it was built from OTHER documents too,
+and anything you drop is lost for good. You are editing a page, not writing a
+new one from the facts above.
+
+Use [[wikilinks]] only for targets in the whitelist from the message above,
+and add a link to [[summaries/{doc_name}]] where it fits naturally.
 
 Return a JSON object with three keys:
 - "description": A single sentence (under 100 chars) identifying this entity
 - "type": one of __ENTITY_TYPES__
-- "content": The rewritten full entity page in Markdown
+- "content": The full updated entity page in Markdown
 
 Return ONLY valid JSON, no fences.
 """
@@ -605,6 +665,26 @@ def _page_fields(raw: str) -> tuple[str, str, dict | None]:
     if obj is None:
         return "", "", None
     return obj.get("description", ""), (obj.get("content") or ""), obj
+
+
+def _extracted_facts(raw: str) -> list[str]:
+    """Map a fact-extraction LLM response to a list of non-empty fact strings.
+
+    An unparseable or wrong-shaped response yields ``[]``, which callers treat
+    as "this document adds nothing" and skip the merge — the safe direction:
+    the page is left exactly as it was rather than rewritten from a garbled
+    extraction.
+    """
+    try:
+        obj = _parse_page_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(obj, dict):
+        return []
+    facts = obj.get("facts")
+    if not isinstance(facts, list):
+        return []
+    return [f.strip() for f in facts if isinstance(f, str) and f.strip()]
 
 
 def _filter_concept_items(items: list, label: str) -> list[dict]:
@@ -1878,30 +1958,63 @@ async def _compile_concepts(
         name = concept["name"]
         title = concept.get("title", name)
         concept_path = wiki_dir / "concepts" / f"{_sanitize_concept_name(name)}.md"
-        if concept_path.exists():
+        page_exists = concept_path.exists()
+        if page_exists:
             raw_text = concept_path.read_text(encoding="utf-8")
             ex_parts = frontmatter.split(raw_text)
             existing_content = ex_parts[1].strip() if ex_parts is not None else raw_text
         else:
             existing_content = "(page not found — create from scratch)"
         async with semaphore:
-            raw = await _llm_call_page_async(
+            # Step 1 — extract what this document adds. Sees the document
+            # (cached prefix) but writes no page, so nothing can be lost here.
+            facts_raw = await _llm_call_async(
                 model,
                 [
                     system_msg,
                     doc_msg,  # cached (BP1)
                     summary_msg,  # cached (BP2)
-                    known_targets_msg,  # cached (BP3) — whitelist
                     {
                         "role": "user",
-                        "content": _CONCEPT_UPDATE_USER.format(
+                        "content": _PAGE_FACTS_USER.format(
+                            kind="concept",
                             title=title,
                             doc_name=doc_name,
                             existing_content=existing_content,
                         ),
                     },
                 ],
-                f"update: {name}",
+                f"update-facts: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+            facts = _extracted_facts(facts_raw)
+            if page_exists and not facts:
+                # Nothing new to add: hand back the existing body verbatim
+                # rather than spend a rewrite that could only subtract from
+                # it. The normal write path still runs, so `sources:` gains
+                # this document (the relationship is real) while the body is
+                # byte-for-byte unchanged.
+                logger.info("concept %s: document adds no new facts, body left as-is", name)
+                return name, existing_content, True, ""
+            # Step 2 — merge. The document is deliberately NOT in context, so
+            # the page is the only substantial thing the model is looking at.
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    known_targets_msg,  # whitelist
+                    {
+                        "role": "user",
+                        "content": _CONCEPT_MERGE_USER.format(
+                            title=title,
+                            doc_name=doc_name,
+                            existing_content=existing_content,
+                            facts_block="\n".join(f"- {f}" for f in facts),
+                        ),
+                    },
+                ],
+                f"update-merge: {name}",
                 response_format=_JSON_RESPONSE_FORMAT,
                 bundle=bundle,
             )
@@ -1944,31 +2057,57 @@ async def _compile_concepts(
         title = ent.get("title", name)
         etype = ent.get("type", "other")
         epath = wiki_dir / "entities" / f"{_sanitize_concept_name(name)}.md"
-        if epath.exists():
+        page_exists = epath.exists()
+        if page_exists:
             raw_text = epath.read_text(encoding="utf-8")
             ex_parts = frontmatter.split(raw_text)
             existing_content = ex_parts[1].strip() if ex_parts is not None else raw_text
         else:
             existing_content = "(page not found — create from scratch)"
         async with semaphore:
-            raw = await _llm_call_page_async(
+            # Step 1 — extract what this document adds (see _PAGE_FACTS_USER).
+            facts_raw = await _llm_call_async(
                 model,
                 [
                     system_msg,
                     doc_msg,  # cached (BP1)
                     summary_msg,  # cached (BP2)
-                    known_targets_msg,  # cached (BP3) — whitelist
                     {
                         "role": "user",
-                        "content": _ENTITY_UPDATE_USER.format(
+                        "content": _PAGE_FACTS_USER.format(
+                            kind="entity",
+                            title=title,
+                            doc_name=doc_name,
+                            existing_content=existing_content,
+                        ),
+                    },
+                ],
+                f"entity-update-facts: {name}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+            facts = _extracted_facts(facts_raw)
+            if page_exists and not facts:
+                logger.info("entity %s: document adds no new facts, body left as-is", name)
+                return name, existing_content, "", etype
+            # Step 2 — merge, with the document deliberately out of context.
+            raw = await _llm_call_page_async(
+                model,
+                [
+                    system_msg,
+                    known_targets_msg,  # whitelist
+                    {
+                        "role": "user",
+                        "content": _ENTITY_MERGE_USER.format(
                             title=title,
                             type=etype,
                             doc_name=doc_name,
                             existing_content=existing_content,
+                            facts_block="\n".join(f"- {f}" for f in facts),
                         ).replace("__ENTITY_TYPES__", types_str),
                     },
                 ],
-                f"entity-update: {name}",
+                f"entity-update-merge: {name}",
                 response_format=_JSON_RESPONSE_FORMAT,
                 bundle=bundle,
             )

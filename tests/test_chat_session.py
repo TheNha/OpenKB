@@ -9,7 +9,12 @@ import pytest
 
 from openkb.agent import chat as chat_mod
 from openkb.agent.chat import iter_chat_turn_events
-from openkb.agent.chat_session import ChatSession, load_session
+from openkb.agent.chat_session import (
+    ChatSession,
+    apply_history_window,
+    load_session,
+    resolve_chat_history_turns,
+)
 
 
 def _image_history() -> list[dict[str, object]]:
@@ -201,3 +206,113 @@ async def test_substantive_streamed_text_is_not_duplicated_by_final(tmp_path, mo
     text_steps = [s for s in persisted_trace if s.get("kind") == "text"]
     assert len(text_steps) == 1
     assert text_steps[0]["text"] == "The real answer."
+
+
+# ---------------------------------------------------------------------------
+# resolve_chat_history_turns / apply_history_window
+# ---------------------------------------------------------------------------
+
+
+def _turn(q: str, a: str, *, with_tool: bool = True) -> list[dict[str, object]]:
+    """A synthetic turn segment: user message, optional tool call/output,
+    final assistant message — mirrors the real agents-SDK to_input_list shape."""
+    segment: list[dict[str, object]] = [{"role": "user", "content": q}]
+    if with_tool:
+        segment.append(
+            {"type": "function_call", "call_id": "c1", "name": "read_file", "arguments": "{}"}
+        )
+        segment.append({"type": "function_call_output", "call_id": "c1", "output": "page text"})
+    segment.append(
+        {
+            "role": "assistant",
+            "type": "message",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": a, "annotations": []}],
+        }
+    )
+    return segment
+
+
+class TestResolveChatHistoryTurns:
+    def test_defaults_when_unset(self, tmp_path):
+        assert resolve_chat_history_turns(tmp_path) == 5
+
+    def test_kb_config_overrides_default(self, tmp_path):
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        (openkb_dir / "config.yaml").write_text("chat_history_turns: 2\n", encoding="utf-8")
+        assert resolve_chat_history_turns(tmp_path) == 2
+
+    def test_invalid_value_falls_back_to_default(self, tmp_path):
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        (openkb_dir / "config.yaml").write_text("chat_history_turns: -1\n", encoding="utf-8")
+        assert resolve_chat_history_turns(tmp_path) == 5
+
+
+class TestApplyHistoryWindow:
+    def test_single_kept_turn_stays_raw_even_with_room_to_spare(self):
+        """Only the single most recent turn ever keeps its raw tool-call
+        detail — window controls how many turns are retained at all (even in
+        light form), not how many stay raw."""
+        history = _turn("q1", "a1") + _turn("q2", "a2")
+        out = apply_history_window(history, ["q1", "q2"], ["a1", "a2"], window=5)
+        assert out != history
+        tool_calls = [item for item in out if item.get("type") == "function_call"]
+        assert len(tool_calls) == 1
+        user_contents = [item.get("content") for item in out if item.get("role") == "user"]
+        assert user_contents == ["q1", "q2"]
+
+    def test_beyond_window_drops_oldest_turns_entirely(self):
+        history = _turn("q1", "a1") + _turn("q2", "a2") + _turn("q3", "a3")
+        out = apply_history_window(history, ["q1", "q2", "q3"], ["a1", "a2", "a3"], window=2)
+        # Only q2/q3 survive at all.
+        contents = [item.get("content") for item in out if item.get("role") == "user"]
+        assert contents == ["q2", "q3"]
+
+    def test_only_most_recent_kept_turn_keeps_tool_calls(self):
+        history = _turn("q1", "a1") + _turn("q2", "a2") + _turn("q3", "a3")
+        out = apply_history_window(history, ["q1", "q2", "q3"], ["a1", "a2", "a3"], window=2)
+        tool_calls = [item for item in out if item.get("type") == "function_call"]
+        # q2's tool call is stripped (collapsed to Q+A); only q3's survives.
+        assert len(tool_calls) == 1
+
+    def test_older_turns_still_carry_their_qa_text(self):
+        history = _turn("q1", "a1") + _turn("q2", "a2") + _turn("q3", "a3")
+        out = apply_history_window(history, ["q1", "q2", "q3"], ["a1", "a2", "a3"], window=2)
+        texts = [
+            part["text"]
+            for item in out
+            if item.get("role") == "assistant"
+            for part in item.get("content", [])
+        ]
+        assert texts == ["a2", "a3"]
+
+    def test_single_turn_untouched_regardless_of_window(self):
+        history = _turn("q1", "a1")
+        out = apply_history_window(history, ["q1"], ["a1"], window=5)
+        assert out == history
+
+
+def test_record_turn_collapses_older_turns_beyond_window(tmp_path):
+    openkb_dir = tmp_path / ".openkb"
+    openkb_dir.mkdir()
+    (openkb_dir / "config.yaml").write_text("chat_history_turns: 2\n", encoding="utf-8")
+
+    session = ChatSession.new(tmp_path, "gpt-4o-mini", "en")
+    session.record_turn("q1", "a1", _turn("q1", "a1"))
+    combined = session.history + _turn("q2", "a2")
+    session.record_turn("q2", "a2", combined)
+
+    # Both turns are within the window=2, so both survive — but only q2 (the
+    # latest) keeps its tool call; q1 collapses to a light Q+A pair.
+    tool_calls = [item for item in session.history if item.get("type") == "function_call"]
+    assert len(tool_calls) == 1
+    user_contents = [item.get("content") for item in session.history if item.get("role") == "user"]
+    assert user_contents == ["q1", "q2"]
+
+    # A 3rd turn pushes q1 out of the window (=2) entirely.
+    combined2 = session.history + _turn("q3", "a3")
+    session.record_turn("q3", "a3", combined2)
+    user_contents2 = [item.get("content") for item in session.history if item.get("role") == "user"]
+    assert user_contents2 == ["q2", "q3"]

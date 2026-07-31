@@ -4,7 +4,10 @@ Each session lives in ``<kb>/.openkb/chats/<id>.json`` and stores a sanitized
 agent-SDK history (from ``RunResult.to_input_list()``) alongside the user
 messages and full assistant replies kept as plain strings for display and
 export. Large tool-returned image payloads are replaced with lightweight
-references before the history is reused or persisted.
+references before the history is reused or persisted. Turns older than the
+configured window are additionally collapsed to a plain Q+A pair (see
+``apply_history_window``), so a long-running session's per-turn LLM request
+doesn't grow every raw wiki-page fetch forever.
 """
 
 from __future__ import annotations
@@ -19,6 +22,92 @@ from pathlib import Path
 from typing import Any
 
 _IMAGE_HISTORY_NOTE = "Image output omitted from chat history to avoid persisting raw data URLs."
+
+_DEFAULT_CHAT_HISTORY_TURNS = 5
+
+
+def resolve_chat_history_turns(kb_dir: Path) -> int:
+    """How many of the most recent turns keep their full tool-call detail in
+    a chat session's history before older turns collapse to a plain Q+A pair
+    (see :func:`apply_history_window`).
+
+    Configurable via ``chat_history_turns:`` in a KB's ``config.yaml``,
+    falling back to ``global.yaml`` then :data:`_DEFAULT_CHAT_HISTORY_TURNS`
+    — same KB-wins-over-global pattern as other per-KB tuning knobs. Any
+    non-positive-int value (unset, wrong type, <= 0) resolves to the default.
+    """
+    from openkb.config import load_global_config, resolve_effective_config
+
+    config = resolve_effective_config(kb_dir)[0]
+    value = config.get("chat_history_turns")
+    if value is None:
+        value = load_global_config().get("chat_history_turns")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return _DEFAULT_CHAT_HISTORY_TURNS
+    return value
+
+
+def _split_into_turns(history: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split a flat agents-SDK input list into per-turn segments, each
+    starting at the user message that opened it (every turn begins with
+    exactly one ``{"role": "user", ...}`` item)."""
+    turns: list[list[dict[str, Any]]] = []
+    for item in history:
+        if isinstance(item, dict) and item.get("role") == "user":
+            turns.append([item])
+        elif turns:
+            turns[-1].append(item)
+        else:
+            # Malformed/legacy history with no leading user item — keep it
+            # rather than drop it silently.
+            turns.append([item])
+    return turns
+
+
+def _light_turn(user_message: str, assistant_text: str) -> list[dict[str, Any]]:
+    """A plain Q+A pair with no tool-call detail — for turns outside the
+    recent window, so the model still knows what was discussed without
+    resending the (often large) raw wiki-page fetches that produced it."""
+    return [
+        {"role": "user", "content": user_message},
+        {
+            "role": "assistant",
+            "type": "message",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": assistant_text, "annotations": []}],
+        },
+    ]
+
+
+def apply_history_window(
+    history: list[dict[str, Any]],
+    user_turns: list[str],
+    assistant_texts: list[str],
+    window: int,
+) -> list[dict[str, Any]]:
+    """Bound history to the last *window* turns; within that window, only
+    the most recent turn keeps its full tool-call detail — earlier ones
+    collapse to a plain Q+A pair via :func:`_light_turn`. Turns older than
+    the window are dropped entirely. A new question therefore always
+    re-reads the wiki fresh for anything beyond the last turn's context,
+    instead of accumulating every turn's raw page fetches forever — the
+    per-turn LLM request stays roughly bounded as a session grows.
+    """
+    turns = _split_into_turns(history)
+    kept = turns[-window:] if len(turns) > window else turns
+    start_idx = len(turns) - len(kept)
+
+    out: list[dict[str, Any]] = []
+    last_offset = len(kept) - 1
+    for offset, segment in enumerate(kept):
+        turn_idx = start_idx + offset
+        if offset == last_offset:
+            out.extend(segment)
+        elif turn_idx < len(user_turns) and turn_idx < len(assistant_texts):
+            out.extend(_light_turn(user_turns[turn_idx], assistant_texts[turn_idx]))
+        else:
+            out.extend(segment)  # no Q/A text on record — keep the raw segment
+    return out
 
 
 def _utcnow_iso() -> str:
@@ -172,9 +261,18 @@ class ChatSession:
         new_history: list[dict[str, Any]],
         trace: list[dict[str, Any]] | None = None,
     ) -> None:
-        self.history = sanitize_history(new_history)
+        # kb_dir is 3 levels up from <kb_dir>/.openkb/chats/<id>.json — derived
+        # here (rather than threaded through every call site) so the history
+        # window can be resolved per-KB without changing record_turn's callers.
+        kb_dir = self.path.parent.parent.parent
+        # Append first so apply_history_window's Q/A lookup for older turns
+        # (including this new one, if window == 1) sees the complete lists.
         self.user_turns.append(user_message)
         self.assistant_texts.append(assistant_text)
+        window = resolve_chat_history_turns(kb_dir)
+        self.history = apply_history_window(
+            sanitize_history(new_history), self.user_turns, self.assistant_texts, window
+        )
         # Keep assistant_traces aligned 1:1 with assistant_texts. A session
         # created before traces existed (or via the CLI, which passes none)
         # back-fills empty traces for its earlier turns so index i always maps
