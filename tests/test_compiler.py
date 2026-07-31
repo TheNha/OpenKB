@@ -1881,6 +1881,55 @@ class TestCompileConceptsPlan:
         assert "https://old.example/spec" in text
         assert "summaries/test-doc.md" in text  # relationship still recorded
 
+    @pytest.mark.asyncio
+    async def test_plan_create_for_an_existing_page_is_rerouted_to_update(self, tmp_path):
+        """A plan that says "create" for a page that already exists must not
+        regenerate it from this document alone.
+
+        Observed in a real ingest: a second document planned `entity: way4`
+        as a create even though the page existed. The create path never reads
+        the existing page, and the write path decides create-vs-update from
+        disk — so the existing body was replaced wholesale while `sources:`
+        kept listing every contributing document, hiding the loss.
+        """
+        wiki = self._setup_wiki(
+            tmp_path,
+            existing_concepts={
+                "attention": '---\nsources: ["summaries/old.md"]\n---\n\n'
+                "# Attention\n\n## Prior aspect\n\nSee https://old.example/spec.\n",
+            },
+        )
+        # Plan mistakenly lists the existing page under "create".
+        plan = json.dumps(
+            {"create": [{"name": "attention", "title": "Attention"}], "update": [], "related": []}
+        )
+        seen = {"facts": 0, "merge": 0, "doc_visible_to_merge": None}
+        merged = (
+            "# Attention\n\n## Prior aspect\n\nSee https://old.example/spec.\n\n"
+            "## Added\n\nNew detail.\n"
+        )
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.completion = MagicMock(side_effect=_mock_completion([plan]))
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=self._two_step_dispatch(seen, ["New detail."], merged)
+            )
+            await _compile_concepts(
+                wiki,
+                tmp_path,
+                "gpt-4o-mini",
+                {"role": "system", "content": "You are a wiki agent."},
+                {"role": "user", "content": "DOC-BODY-MARKER full document text."},
+                "Summary.",
+                "test-doc",
+                5,
+            )
+
+        # It went down the two-step update path, not the from-scratch create.
+        assert seen["facts"] == 1 and seen["merge"] == 1
+        text = (wiki / "concepts" / "attention.md").read_text(encoding="utf-8")
+        assert "https://old.example/spec" in text  # earlier document's fact survives
+
     def test_parse_page_json_unwraps_and_guards_shape(self):
         """#158: _parse_page_json returns an object, unwraps a single-element
         ``[{...}]`` array, and returns None for wrong-shaped-but-valid JSON."""
@@ -2749,6 +2798,51 @@ def test_known_targets_prompt_has_entities_rule():
     from openkb.agent.compiler import _KNOWN_TARGETS_USER
 
     assert "[[entities/" in _KNOWN_TARGETS_USER
+
+
+class TestRerouteExistingCreates:
+    """Disk, not the plan, decides whether a page is being created."""
+
+    def _item(self, name):
+        return {"name": name, "title": name.title()}
+
+    def test_existing_page_moves_from_create_to_update(self, tmp_path):
+        from openkb.agent.compiler import _reroute_existing_creates
+
+        (tmp_path / "way4.md").write_text("x", encoding="utf-8")
+        create, update = _reroute_existing_creates([self._item("way4")], [], tmp_path)
+
+        assert create == []
+        assert [i["name"] for i in update] == ["way4"]
+
+    def test_absent_page_stays_a_create(self, tmp_path):
+        from openkb.agent.compiler import _reroute_existing_creates
+
+        create, update = _reroute_existing_creates([self._item("brand-new")], [], tmp_path)
+
+        assert [i["name"] for i in create] == ["brand-new"]
+        assert update == []
+
+    def test_item_planned_as_both_is_not_generated_twice(self, tmp_path):
+        from openkb.agent.compiler import _reroute_existing_creates
+
+        (tmp_path / "way4.md").write_text("x", encoding="utf-8")
+        create, update = _reroute_existing_creates(
+            [self._item("way4")], [self._item("way4")], tmp_path
+        )
+
+        assert create == []
+        assert len(update) == 1
+
+    def test_name_is_sanitized_before_the_existence_check(self, tmp_path):
+        """Plan names are free-form; the file on disk uses the sanitized slug."""
+        from openkb.agent.compiler import _reroute_existing_creates
+
+        (tmp_path / "acc-seabank.md").write_text("x", encoding="utf-8")
+        create, update = _reroute_existing_creates([self._item("acc seabank")], [], tmp_path)
+
+        assert create == []
+        assert len(update) == 1
 
 
 def test_plan_prompt_keeps_topic_itself_guard():

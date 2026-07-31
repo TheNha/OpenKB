@@ -741,6 +741,44 @@ def _filter_related_slugs(items: list) -> list[str]:
     return valid
 
 
+def _reroute_existing_creates(
+    create_items: list[dict], update_items: list[dict], pages_dir: Path
+) -> tuple[list[dict], list[dict]]:
+    """Move planned "create" items whose page already exists into "update".
+
+    The plan prompt tells the model to prefer "update" for anything already
+    on the existing-pages list, but it does not reliably comply. Left alone, a
+    mis-planned "create" generates a page from scratch off this one document
+    and the write path — which decides create-vs-update from disk, not from
+    the plan — then replaces the existing body with it, deleting whatever
+    earlier documents had contributed. The `sources:` frontmatter survives
+    that, so the loss leaves no visible trace. The plan is a suggestion; disk
+    is the authority.
+
+    Returns ``(create_items, update_items)`` with the reroute applied. An item
+    listed in BOTH groups is kept only once, so it isn't generated twice.
+    """
+    still_create: list[dict] = []
+    rerouted: list[dict] = []
+    claimed = {_sanitize_concept_name(item["name"]) for item in update_items}
+    for item in create_items:
+        safe = _sanitize_concept_name(item["name"])
+        if not (pages_dir / f"{safe}.md").exists():
+            still_create.append(item)
+            continue
+        if safe not in claimed:
+            rerouted.append(item)
+            claimed.add(safe)
+    if rerouted:
+        logger.info(
+            "re-routed %d planned create(s) to update in %s/ (page already exists): %s",
+            len(rerouted),
+            pages_dir.name,
+            [item["name"] for item in rerouted],
+        )
+    return still_create, update_items + rerouted
+
+
 def _filter_entity_items(items: object, valid_types: frozenset | None = None) -> list[dict]:
     """Validate entity create/update objects: require name+title, coerce type.
 
@@ -1825,6 +1863,17 @@ async def _compile_concepts(
     entity_create = entities_plan["create"]
     entity_update = entities_plan["update"]
     entity_related = entities_plan["related"]
+
+    # A "create" for a page that already exists would regenerate it from this
+    # document alone and overwrite what other documents contributed — reroute
+    # those to the update path, which reads the existing page first.
+
+    create_items, update_items = _reroute_existing_creates(
+        create_items, update_items, wiki_dir / "concepts"
+    )
+    entity_create, entity_update = _reroute_existing_creates(
+        entity_create, entity_update, wiki_dir / "entities"
+    )
 
     # "related" must reference pages that ALREADY exist on disk (the plan
     # prompt asks for existing slugs). The LLM sometimes lists non-existent
