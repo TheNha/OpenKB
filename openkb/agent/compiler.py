@@ -124,6 +124,11 @@ Rules:
   sparse documents.
 - Prefer "update" over "create" for any concept or entity already listed above.
 - Do NOT create a concept/entity that overlaps an existing one — use "update".
+- Before "create", check the lists above for the SAME real-world thing under a
+  different name or phrasing (e.g. "way4", "way4-system", "way4-banking-system"
+  are the same real system, not three). If it might already be listed, use
+  "update" with that EXISTING slug — never invent a second name for something
+  already on the list.
 - Do NOT create concepts that are just the document topic itself.
 - "related" is lightweight cross-linking only, no content rewrite.
 - "update" vs "related" for an existing concept/entity: if this document
@@ -276,6 +281,44 @@ Return a JSON object with three keys:
 - "content": The full updated entity page in Markdown
 
 Return ONLY valid JSON, no fences.
+"""
+
+# --- Near-duplicate arbitration -----------------------------------------
+#
+# The plan sometimes invents a new name for a {kind} that already has a page
+# under a different name (observed: "way4", "way4-system",
+# "way4-banking-system" as three separate entity pages for one real system).
+# A cheap leading-word heuristic flags candidates, but blindly rerouting on
+# that heuristic would be wrong often enough to be dangerous — e.g.
+# "seabank" (the bank) vs. "seabank-camera-system" (one specific system at
+# the bank) share a leading word but are not the same thing, and merging them
+# would silently contaminate the org page. So flagged candidates go through
+# one small, isolated LLM call: only the two names/briefs are in view (no
+# source document, so nothing biases it toward "yes"), and an unparseable or
+# "no match" answer leaves the item as "create" rather than force a merge.
+
+_DUPLICATE_CHECK_SYSTEM = (
+    "You arbitrate possible duplicate pages in a wiki knowledge base. "
+    "Answer only from the names and descriptions given — you have no other "
+    "context about either page."
+)
+
+_DUPLICATE_CHECK_USER = """\
+A new {kind} page is about to be created:
+- name: {new_name}
+- title: {new_title}
+
+It shares a leading word with these EXISTING {kind} page(s):
+{candidates}
+
+For each, decide: is it the SAME real-world {kind} as the one being created —
+just reached a different name or phrasing — or a DIFFERENT thing that merely
+starts with the same word (e.g. a specific sub-system vs. the organization
+that runs it)? When genuinely unsure, answer null: a missed merge just means
+two pages exist a little longer, but a wrong merge silently mixes unrelated
+content into an existing page.
+
+Return ONLY valid JSON: {{"same_as": "<existing-slug>"}} or {{"same_as": null}}
 """
 
 # NOTE: the prompt templates intentionally KEEP the literal ``__ENTITY_TYPES__``
@@ -777,6 +820,151 @@ def _reroute_existing_creates(
             [item["name"] for item in rerouted],
         )
     return still_create, update_items + rerouted
+
+
+def _leading_word_candidates(safe_name: str, existing_slugs: list[str]) -> list[str]:
+    """Existing slugs that may be the same name as ``safe_name``, spelled
+    differently.
+
+    Two cheap, high-recall/low-precision heuristics, either one enough to
+    flag a candidate:
+    - same leading hyphen-token: catches "way4" vs. "way4-system", but also
+      "seabank" vs. "seabank-camera-system" (a specific sub-system, NOT the
+      same thing).
+    - same string once hyphens are removed: catches inconsistent
+      hyphenation of one compound name (observed: "seapay-pro" vs.
+      "seapaypro", created as two separate pages from two different
+      documents) — these have different leading tokens, so the first check
+      alone misses them.
+    Callers must not treat a match here as confirmation, only as "worth
+    checking further".
+    """
+    head = safe_name.split("-", 1)[0].lower()
+    dehyphenated = safe_name.replace("-", "").lower()
+    matches = []
+    for slug in existing_slugs:
+        if slug == safe_name:
+            continue
+        same_leading = len(head) >= 3 and slug.split("-", 1)[0].lower() == head
+        same_dehyphenated = len(dehyphenated) >= 3 and slug.replace("-", "").lower() == dehyphenated
+        if same_leading or same_dehyphenated:
+            matches.append(slug)
+    return matches
+
+
+def _page_brief(path: Path) -> str:
+    """One-line brief for a wiki page: frontmatter description, else body excerpt."""
+    text = path.read_text(encoding="utf-8")
+    fm_dict = frontmatter.parse(text)
+    brief = _resolve_description(fm_dict)
+    if brief:
+        return brief
+    parts = frontmatter.split(text)
+    body = parts[1] if parts is not None else text
+    return body.strip().replace("\n", " ")[:150]
+
+
+async def _resolve_near_duplicate_creates(
+    create_items: list[dict],
+    update_items: list[dict],
+    pages_dir: Path,
+    kind: str,
+    model: str,
+    bundle=None,
+) -> tuple[list[dict], list[dict]]:
+    """Arbitrate leading-word near-duplicates before they're created.
+
+    The plan prompt now asks the model to reuse an existing slug for the same
+    real-world thing, but that instruction alone isn't reliable — the same
+    entity has been observed getting a different slug per document (e.g.
+    "way4", "way4-system", "way4-banking-system" as three separate pages).
+    ``_reroute_existing_creates`` only catches exact-slug collisions, so it
+    misses this.
+
+    A blind reroute on the leading-word heuristic would be wrong often enough
+    to be dangerous (a specific sub-system can share a leading word with the
+    organization that runs it, and those are not the same page). So each
+    flagged candidate goes through one small, isolated LLM call — only the
+    two names/briefs in view, no source document to bias it — and only
+    reroutes create -> update (onto the EXISTING slug) when the model
+    confirms they're the same thing. Anything ambiguous, unparseable, or "no"
+    is logged and left as "create", same as before.
+    """
+    if not create_items or not pages_dir.exists():
+        return create_items, update_items
+    existing_slugs = sorted(p.stem for p in pages_dir.glob("*.md"))
+    if not existing_slugs:
+        return create_items, update_items
+
+    still_create: list[dict] = []
+    resolved_updates: list[dict] = []
+    claimed = {_sanitize_concept_name(item["name"]) for item in update_items}
+
+    for item in create_items:
+        safe = _sanitize_concept_name(item["name"])
+        candidates = _leading_word_candidates(safe, existing_slugs)
+        if not candidates:
+            still_create.append(item)
+            continue
+
+        brief_lines = "\n".join(
+            f"- {slug}: {_page_brief(pages_dir / f'{slug}.md')}" for slug in candidates
+        )
+        same_as: str | None = None
+        try:
+            raw = await _llm_call_async(
+                model,
+                [
+                    {"role": "system", "content": _DUPLICATE_CHECK_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": _DUPLICATE_CHECK_USER.format(
+                            kind=kind,
+                            new_name=safe,
+                            new_title=item.get("title", safe),
+                            candidates=brief_lines,
+                        ),
+                    },
+                ],
+                f"dedup-check: {safe}",
+                response_format=_JSON_RESPONSE_FORMAT,
+                bundle=bundle,
+            )
+            parsed = _parse_json(raw)
+            if isinstance(parsed, dict):
+                val = parsed.get("same_as")
+                if isinstance(val, str) and val.strip() in candidates:
+                    same_as = val.strip()
+        except (json.JSONDecodeError, ValueError):
+            same_as = None
+        except Exception:
+            logger.warning(
+                "dedup-check LLM call failed for %r; leaving as create", safe, exc_info=True
+            )
+            same_as = None
+
+        if same_as and same_as not in claimed:
+            logger.info(
+                "LLM-confirmed duplicate %s: routing %r to update on existing %r (candidates were %s)",
+                kind,
+                safe,
+                same_as,
+                candidates,
+            )
+            resolved_updates.append({**item, "name": same_as})
+            claimed.add(same_as)
+        else:
+            logger.warning(
+                "possible duplicate %s: creating %r shares a leading word with "
+                "existing page(s) %s but was not confirmed as the same — "
+                "verify manually if these keep diverging.",
+                kind,
+                safe,
+                candidates,
+            )
+            still_create.append(item)
+
+    return still_create, update_items + resolved_updates
 
 
 def _filter_entity_items(items: object, valid_types: frozenset | None = None) -> list[dict]:
@@ -1873,6 +2061,16 @@ async def _compile_concepts(
     )
     entity_create, entity_update = _reroute_existing_creates(
         entity_create, entity_update, wiki_dir / "entities"
+    )
+
+    # Exact-slug reroute above can't catch the same real-world thing getting a
+    # different slug per document — arbitrate likely aliases via a small LLM
+    # call each, rerouting to update only when confirmed as the same thing.
+    create_items, update_items = await _resolve_near_duplicate_creates(
+        create_items, update_items, wiki_dir / "concepts", "concept", model, bundle=bundle
+    )
+    entity_create, entity_update = await _resolve_near_duplicate_creates(
+        entity_create, entity_update, wiki_dir / "entities", "entity", model, bundle=bundle
     )
 
     # "related" must reference pages that ALREADY exist on disk (the plan

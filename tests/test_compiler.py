@@ -2845,6 +2845,140 @@ class TestRerouteExistingCreates:
         assert len(update) == 1
 
 
+class TestResolveNearDuplicateCreates:
+    """Same real-world entity/concept can get a different slug per document
+    (observed: "way4", "way4-system", "way4-banking-system" as three separate
+    entity pages, and "seapay-pro" vs. "seapaypro" — inconsistent
+    hyphenation of one name). ``_reroute_existing_creates`` only matches
+    identical slugs, so this is a distinct safety net. It must never reroute
+    on the heuristics alone (e.g. "seabank" vs. "seabank-camera-system" are
+    NOT the same thing) — only an LLM-confirmed match may move a "create" to
+    "update", and only onto the EXISTING slug."""
+
+    def _item(self, name):
+        return {"name": name, "title": name.title()}
+
+    @pytest.mark.asyncio
+    async def test_llm_confirmed_duplicate_is_rerouted_to_update_on_existing_slug(self, tmp_path):
+        from openkb.agent.compiler import _resolve_near_duplicate_creates
+
+        (tmp_path / "way4-banking-system.md").write_text(
+            '---\ndescription: "The Way4 card system"\n---\nbody', encoding="utf-8"
+        )
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=_mock_acompletion([json.dumps({"same_as": "way4-banking-system"})])
+            )
+            create, update = await _resolve_near_duplicate_creates(
+                [self._item("way4-system")], [], tmp_path, "entity", "test-model"
+            )
+
+        assert create == []
+        assert len(update) == 1
+        assert update[0]["name"] == "way4-banking-system"
+
+    @pytest.mark.asyncio
+    async def test_inconsistent_hyphenation_is_flagged_as_a_candidate(self, tmp_path):
+        """Regression: "seapay-pro" and "seapaypro" — the same real entity,
+        hyphenated differently by two documents — have different leading
+        tokens ("seapay" vs. "seapaypro"), so the leading-word check alone
+        misses them. Removing hyphens before comparing must catch it."""
+        from openkb.agent.compiler import _resolve_near_duplicate_creates
+
+        (tmp_path / "seapaypro.md").write_text(
+            '---\ndescription: "Internal payment system"\n---\nbody', encoding="utf-8"
+        )
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=_mock_acompletion([json.dumps({"same_as": "seapaypro"})])
+            )
+            create, update = await _resolve_near_duplicate_creates(
+                [self._item("seapay-pro")], [], tmp_path, "entity", "test-model"
+            )
+
+        assert create == []
+        assert len(update) == 1
+        assert update[0]["name"] == "seapaypro"
+
+    @pytest.mark.asyncio
+    async def test_llm_says_different_thing_stays_a_create(self, tmp_path):
+        """ "seabank" vs. "seabank-camera-system" share a leading word but are
+        not the same real-world thing — the model saying so must leave the
+        item as "create", not force it onto the org's page."""
+        from openkb.agent.compiler import _resolve_near_duplicate_creates
+
+        (tmp_path / "seabank.md").write_text(
+            '---\ndescription: "SeABank, the bank"\n---\nbody', encoding="utf-8"
+        )
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(
+                side_effect=_mock_acompletion([json.dumps({"same_as": None})])
+            )
+            create, update = await _resolve_near_duplicate_creates(
+                [self._item("seabank-camera-system")], [], tmp_path, "entity", "test-model"
+            )
+
+        assert [i["name"] for i in create] == ["seabank-camera-system"]
+        assert update == []
+
+    @pytest.mark.asyncio
+    async def test_unparseable_llm_response_stays_a_create(self, tmp_path):
+        """An ambiguous/broken answer must never be treated as confirmation —
+        a missed merge is recoverable, a wrong one silently corrupts a page."""
+        from openkb.agent.compiler import _resolve_near_duplicate_creates
+
+        (tmp_path / "way4.md").write_text('---\ndescription: "x"\n---\nbody', encoding="utf-8")
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(side_effect=_mock_acompletion(["not json"]))
+            create, update = await _resolve_near_duplicate_creates(
+                [self._item("way4-system")], [], tmp_path, "entity", "test-model"
+            )
+
+        assert [i["name"] for i in create] == ["way4-system"]
+        assert update == []
+
+    @pytest.mark.asyncio
+    async def test_unrelated_name_makes_no_llm_call(self, tmp_path):
+        from openkb.agent.compiler import _resolve_near_duplicate_creates
+
+        (tmp_path / "seabank.md").write_text('---\ndescription: "x"\n---\nbody', encoding="utf-8")
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(side_effect=AssertionError("should not be called"))
+            create, update = await _resolve_near_duplicate_creates(
+                [self._item("way4")], [], tmp_path, "entity", "test-model"
+            )
+
+        assert [i["name"] for i in create] == ["way4"]
+        assert update == []
+        mock_litellm.acompletion.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_existing_pages_makes_no_llm_call(self, tmp_path):
+        from openkb.agent.compiler import _resolve_near_duplicate_creates
+
+        with patch("openkb.agent.compiler.litellm") as mock_litellm:
+            mock_litellm.acompletion = AsyncMock(side_effect=AssertionError("should not be called"))
+            create, update = await _resolve_near_duplicate_creates(
+                [self._item("way4")], [], tmp_path, "entity", "test-model"
+            )
+
+        assert [i["name"] for i in create] == ["way4"]
+        assert update == []
+        mock_litellm.acompletion.assert_not_called()
+
+
+def test_plan_prompt_warns_against_aliasing_an_existing_name():
+    """Regression: the plan created three separate entity pages for the same
+    real system under three names ("way4", "way4-system",
+    "way4-banking-system"). The prompt must tell the model to reuse an
+    existing slug for the same real-world thing instead of inventing a new
+    name for it."""
+    from openkb.agent.compiler import _CONCEPTS_PLAN_USER
+
+    assert "way4-banking-system" in _CONCEPTS_PLAN_USER
+    assert "never invent a second name" in _CONCEPTS_PLAN_USER
+
+
 def test_plan_prompt_keeps_topic_itself_guard():
     """The concept-plan prompt must retain the guard against creating a concept
     that merely mirrors the document's own topic."""
